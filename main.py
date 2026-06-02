@@ -23,7 +23,6 @@ from __future__ import annotations
 import asyncio
 import inspect
 import json
-from collections.abc import AsyncGenerator
 from typing import Any
 
 from astrbot.api import logger, star
@@ -45,6 +44,13 @@ class Main(star.Star):
         self.context = context
         # Cached catalog: None means cache is stale
         self._catalog_cache: list[dict[str, Any]] | None = None
+        # P0-1: Initialize _patched flag
+        self._patched = False
+        # P1-2 / P0-2: Store original references for patch restoration
+        self._orig_activate: Any = None
+        self._orig_deactivate: Any = None
+        self._orig_pm_turn_off: Any = None
+        self._orig_pm_turn_on: Any = None
 
     async def initialize(self) -> None:
         from astrbot.core.provider.register import llm_tools
@@ -117,6 +123,23 @@ class Main(star.Star):
         # that do NOT emit on_plugin_loaded / on_plugin_unloaded events.
         self._monkey_patch()
 
+    # P0-2: Lifecycle cleanup to restore monkey patches
+    async def terminate(self) -> None:
+        """插件卸载/停用时还原猴子补丁。"""
+        # Restore FunctionToolManager patches
+        if self._orig_activate is not None:
+            from astrbot.core.provider.register import llm_tools
+            llm_tools.activate_llm_tool = self._orig_activate
+            llm_tools.deactivate_llm_tool = self._orig_deactivate
+            logger.info("Plugin Toolifier: restored FunctionToolManager patches")
+
+        # Restore PluginManager patches
+        if self._orig_pm_turn_off is not None:
+            from astrbot.core.star.star_manager import PluginManager
+            PluginManager.turn_off_plugin = self._orig_pm_turn_off
+            PluginManager.turn_on_plugin = self._orig_pm_turn_on
+            logger.info("Plugin Toolifier: restored PluginManager patches")
+
     # ---- Monkey-patching for complete cache invalidation coverage ----
 
     def _monkey_patch(self) -> None:
@@ -140,19 +163,20 @@ class Main(star.Star):
         # Patch 1: FunctionToolManager.activate_llm_tool / deactivate_llm_tool
         from astrbot.core.provider.register import llm_tools
 
-        _orig_activate = llm_tools.activate_llm_tool
-        _orig_deactivate = llm_tools.deactivate_llm_tool
+        # P1-2: Save original references to instance attributes for restore
+        self._orig_activate = llm_tools.activate_llm_tool
+        self._orig_deactivate = llm_tools.deactivate_llm_tool
 
         def _wrap_activate(name: str, star_map: dict) -> bool:
             """Wrap activate_llm_tool to invalidate cache on success."""
-            result = _orig_activate(name, star_map)
+            result = self._orig_activate(name, star_map)
             if result:
                 self._invalidate_cache()
             return result
 
         def _wrap_deactivate(name: str) -> bool:
             """Wrap deactivate_llm_tool to invalidate cache on success."""
-            result = _orig_deactivate(name)
+            result = self._orig_deactivate(name)
             if result:
                 self._invalidate_cache()
             return result
@@ -164,18 +188,19 @@ class Main(star.Star):
         # These are async methods, so wrapped versions must also be async.
         from astrbot.core.star.star_manager import PluginManager
 
-        _pm_orig_turn_off = PluginManager.turn_off_plugin
-        _pm_orig_turn_on = PluginManager.turn_on_plugin
+        # P1-2: Save original references
+        self._orig_pm_turn_off = PluginManager.turn_off_plugin
+        self._orig_pm_turn_on = PluginManager.turn_on_plugin
 
         async def _pm_wrap_turn_off(self_inst: PluginManager, plugin_name: str) -> None:
             """Wrap turn_off_plugin to invalidate cache after the plugin is turned off."""
-            await _pm_orig_turn_off(self_inst, plugin_name)
+            await self._orig_pm_turn_off(self_inst, plugin_name)
             self._invalidate_cache()
             logger.debug(f"Plugin {plugin_name} turned off, cleared discovery cache")
 
         async def _pm_wrap_turn_on(self_inst: PluginManager, plugin_name: str) -> None:
             """Wrap turn_on_plugin to invalidate cache after the plugin is turned on."""
-            await _pm_orig_turn_on(self_inst, plugin_name)
+            await self._orig_pm_turn_on(self_inst, plugin_name)
             self._invalidate_cache()
             logger.debug(f"Plugin {plugin_name} turned on, cleared discovery cache")
 
@@ -309,30 +334,30 @@ class Main(star.Star):
         if not catalog:
             return "当前没有加载任何提供 LLM Tool 的插件。"
 
-        lines = [f"\U0001f4e6 \u5df2\u52a0\u8f7d {len(catalog)} \u4e2a\u63d2\u4ef6\uff08\u63d0\u4f9b LLM \u5de5\u5177\uff09\uff1a\n"]
+        lines = [f"\U0001f4e6 已加载 {len(catalog)} 个插件（提供 LLM 工具）：\n"]
 
         for info in catalog:
-            status = "\u2705" if info["activated"] else "\u23f8\ufe0f"
-            reserved_tag = " (\u5185\u7f6e)" if info["reserved"] else ""
+            status = "✅" if info["activated"] else "⏸️"
+            reserved_tag = " (内置)" if info["reserved"] else ""
             lines.append(f"  {status} **{info['name']}**{reserved_tag}")
             if info["author"]:
-                lines.append(f"     \u4f5c\u8005: {info['author']}")
+                lines.append(f"     作者: {info['author']}")
             if info["version"]:
-                lines.append(f"     \u7248\u672c: {info['version']}")
+                lines.append(f"     版本: {info['version']}")
             if info["desc"]:
-                lines.append(f"     \u63cf\u8ff0: {info['desc']}")
+                lines.append(f"     描述: {info['desc']}")
 
-            lines.append(f"     LLM \u5de5\u5177 ({len(info['tools'])}):")
+            lines.append(f"     LLM 工具 ({len(info['tools'])}):")
             for tool in info["tools"]:
                 lines.append(f"       - `{tool['name']}`: {tool['description']}")
             lines.append("")
 
             if info["commands"]:
-                lines.append(f"     \u547d\u4ee4 ({len(info['commands'])}):")
+                lines.append(f"     命令 ({len(info['commands'])}):")
                 for cmd in info["commands"][:10]:
                     lines.append(f"       - {cmd}")
                 if len(info["commands"]) > 10:
-                    lines.append(f"       ... \u8fd8\u6709 {len(info['commands']) - 10} \u4e2a")
+                    lines.append(f"       ... 还有 {len(info['commands']) - 10} 个")
                 lines.append("")
 
         return "\n".join(lines)
@@ -370,7 +395,7 @@ class Main(star.Star):
                 plugin_info = matches[0]
                 plugin_name = plugin_info["name"]
             else:
-                return f"\u672a\u627e\u5230\u63d2\u4ef6 '{plugin_name}'\u3002\u8bf7\u4f7f\u7528 `list_plugins` \u67e5\u770b\u63d0\u4f9b LLM \u5de5\u5177\u7684\u63d2\u4ef6\u3002"
+                return f"未找到插件 '{plugin_name}'。请使用 `list_plugins` 查看提供 LLM 工具的插件。"
 
         # 工具只精确匹配
         tool_info = None
@@ -381,11 +406,11 @@ class Main(star.Star):
 
         if not tool_info:
             tool_names = [t["name"] for t in plugin_info["tools"]]
-            return f"\u63d2\u4ef6 '{plugin_info['name']}' \u4e2d\u672a\u627e\u5230\u5de5\u5177 '{tool_name}'\u3002\n\u53ef\u7528\u5de5\u5177: {', '.join(tool_names)}"
+            return f"插件 '{plugin_info['name']}' 中未找到工具 '{tool_name}'。\n可用工具: {', '.join(tool_names)}"
 
         func_tool = llm_tools.get_func(tool_info["name"])
         if not func_tool or not func_tool.active:
-            return f"\u5de5\u5177 '{tool_name}' \u672a\u6fc0\u6d3b\u6216\u4e0d\u5b58\u5728\u3002"
+            return f"工具 '{tool_name}' 未激活或不存在。"
 
         parsed_args = self._parse_args(tool_info["parameters"], tool_args)
         if isinstance(parsed_args, str):
@@ -394,8 +419,8 @@ class Main(star.Star):
         try:
             return await self._invoke_func_tool(event, func_tool, parsed_args)
         except Exception as e:
-            logger.exception("\u8c03\u7528\u63d2\u4ef6\u5de5\u5177\u5931\u8d25: %s", tool_name)
-            return f"\u8c03\u7528\u63d2\u4ef6\u5de5\u5177 '{tool_name}' \u5931\u8d25: {e!s}"
+            logger.exception("调用插件工具失败: %s", tool_name)
+            return f"调用插件工具 '{tool_name}' 失败: {e!s}"
 
     async def _invoke_func_tool(
         self,
@@ -409,7 +434,7 @@ class Main(star.Star):
         """
         handler = func_tool.handler
         if handler is None:
-            return f"\u5de5\u5177 '{func_tool.name}' \u6ca1\u6709\u5b9e\u73b0 handler\u3002"
+            return f"工具 '{func_tool.name}' 没有实现 handler。"
 
         # Check if handler is an async generator function
         if inspect.isasyncgenfunction(handler):
@@ -431,20 +456,19 @@ class Main(star.Star):
                     except StopAsyncIteration:
                         break
             except asyncio.TimeoutError:
-                return f"\u5de5\u5177 '{func_tool.name}' \u6267\u884c\u8d85\u65f6\u3002"
+                return f"工具 '{func_tool.name}' 执行超时。"
             finally:
-                # Ensure the async generator is properly closed to clean up
-                # resources. If iteration stopped early (e.g. timeout),
-                # __aclose__ must be called explicitly.
-                gen.aclose()
+                # P1-5: Guard aclose() against None or missing attribute
+                if gen is not None and hasattr(gen, "aclose"):
+                    gen.aclose()
             if not results:
-                return f"\u5de5\u5177 '{func_tool.name}' \u6267\u884c\u5b8c\u6210\u3002"
+                return f"工具 '{func_tool.name}' 执行完成。"
             return "\n".join(results)
 
-        # Regular coroutine
+        # Exception handling is done by the caller (_call_plugin_handler)
         result = await handler(event, **kwargs)
         if result is None:
-            return f"\u5de5\u5177 '{func_tool.name}' \u6267\u884c\u5b8c\u6210\u3002"
+            return f"工具 '{func_tool.name}' 执行完成。"
         if hasattr(result, "message"):
             return str(result.message)
         return str(result)
@@ -455,7 +479,7 @@ class Main(star.Star):
         Supports:
         - JSON dict format: '{"key": "value"}'
         - JSON list format: '["val1", "val2"]'
-        - Simple string (assigned to the first parameter)
+        - Simple string (assigned to the first parameter, with type coercion)
         - Empty string (returns empty dict)
         """
         if not tool_args or not tool_args.strip():
@@ -484,16 +508,32 @@ class Main(star.Star):
         stripped = tool_args.strip()
         # Check for invalid JSON objects/arrays and give helpful errors
         if stripped.startswith("{") and stripped.endswith("}"):
-            return f"\u53c2\u6570\u89e3\u6790\u5931\u8d25\uff0c\u8bf7\u68c0\u67e5 JSON \u683c\u5f0f: {tool_args}"
+            return f"参数解析失败，请检查 JSON 格式: {tool_args}"
         if stripped.startswith("[") and stripped.endswith("]"):
-            return f"\u53c2\u6570\u89e3\u6790\u5931\u8d25\uff0c\u8bf7\u68c0\u67e5 JSON \u683c\u5f0f: {tool_args}"
+            return f"参数解析失败，请检查 JSON 格式: {tool_args}"
 
-        # Simple string -> assign to first parameter
+        # Simple string -> assign to first parameter with type coercion (P1-4)
         props = parameters.get("properties", {})
         if props:
             first_key = next(iter(props), None)
             if first_key:
-                return {first_key: tool_args}
+                prop_schema = props.get(first_key, {})
+                prop_type = prop_schema.get("type", "")
+                value = tool_args
+                # P1-4: Type coercion for string fallback
+                if prop_type == "int":
+                    try:
+                        value = int(tool_args)
+                    except ValueError:
+                        pass
+                elif prop_type == "float":
+                    try:
+                        value = float(tool_args)
+                    except ValueError:
+                        pass
+                elif prop_type == "bool":
+                    value = tool_args.lower() in ("true", "yes", "1")
+                return {first_key: value}
 
         return {}
 
@@ -518,18 +558,19 @@ class Main(star.Star):
     ) -> str:
         catalog = self._build_plugin_catalog()
 
-        keywords_lower = keywords.lower()
+        # P2-2: Renamed variable for clarity (Chinese chars have no case)
+        keywords_normalized = keywords.lower()
         results = []
         for info in catalog:
             for tool in info["tools"]:
-                if (keywords_lower in tool["name"].lower() or
-                    keywords_lower in tool["description"].lower()):
+                if (keywords_normalized in tool["name"].lower() or
+                    keywords_normalized in tool["description"].lower()):
                     results.append((info, tool))
 
         if not results:
-            return f"\u672a\u627e\u5230\u5339\u914d\u5173\u952e\u8bcd '{keywords}' \u7684\u5de5\u5177\u3002\n\n\u8bf7\u4f7f\u7528 `list_plugins` \u67e5\u770b\u6240\u6709\u63d0\u4f9b LLM \u5de5\u5177\u7684\u63d2\u4ef6\u3002"
+            return f"未找到匹配关键词 '{keywords}' 的工具。\n\n请使用 `list_plugins` 查看所有提供 LLM 工具的插件。"
 
-        lines = [f"\U0001f50d \u627e\u5230 {len(results)} \u4e2a\u5339\u914d\u7684\u5de5\u5177\uff1a\n"]
+        lines = [f"\U0001f50d 找到 {len(results)} 个匹配的工具：\n"]
         for info, tool in results:
             lines.append(f"  **{info['name']}** / `{tool['name']}`")
             lines.append(f"    {tool['description']}")
@@ -539,25 +580,24 @@ class Main(star.Star):
 
     # ---- IM command handlers ----
 
+    # P1-3: Unified to use yield event.plain_result() style
     @filter.command("list_plugins")
-    async def cmd_list_plugins(self, event: AstrMessageEvent) -> None:
-        """\u5217\u51fa\u6240\u6709\u63d0\u4f9b LLM \u5de5\u5177\u7684\u63d2\u4ef6"""
+    async def cmd_list_plugins(self, event: AstrMessageEvent):
+        """列出所有提供 LLM 工具的插件"""
         output = await self._list_plugins_handler()
-        event.set_result(event.message_chain.message(output).use_t2i(False))
+        yield event.plain_result(output).use_t2i(False)
 
     @filter.command("search_plugins")
     async def cmd_search_plugins(
         self, event: AstrMessageEvent, keywords: str = ""
-    ) -> None:
-        """\u641c\u7d22\u63d0\u4f9b LLM \u5de5\u5177\u7684\u63d2\u4ef6\u5de5\u5177"""
+    ):
+        """搜索提供 LLM 工具的插件工具"""
         if not keywords.strip():
-            event.set_result(
-                event.message_chain.message("\u8bf7\u63d0\u4f9b\u641c\u7d22\u5173\u952e\u8bcd\uff0c\u4f8b\u5982\uff1a/search_plugins \u7ffb\u8bd1").use_t2i(False)
-            )
+            yield event.plain_result("请提供搜索关键词，例如：/search_plugins 翻译").use_t2i(False)
             return
 
         output = await self._search_plugin_tools_handler(event, keywords)
-        event.set_result(event.message_chain.message(output).use_t2i(False))
+        yield event.plain_result(output).use_t2i(False)
 
     # ---- Cache invalidation hooks ----
 
