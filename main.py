@@ -9,18 +9,21 @@
 
 设计说明：
 - 只暴露有 LLM Tool（function-calling）的插件，过滤纯辅助性质的插件（如分段发送、消息装饰）。
-- 仅在有事件触发时重建缓存（插件加载、卸载、工具激活/停用、插件启停），不再使用定时 TTL。
+- 纯事件驱动缓存：插件加载/卸载、工具激活/停用、插件启停时自动刷新，无定时 TTL。
 
-缓存失效覆盖场景：
+缓存失效覆盖场景（6 个入口全部覆盖）：
 - 插件安装/加载 → on_plugin_loaded 事件
 - 插件卸载 → on_plugin_unloaded 事件
-- 工具单独停用/激活 → FunctionToolManager 方法猴子补丁
-- 插件禁用/启用 → PluginManager 方法猴子补丁
+- 工具单独停用/激活 → FunctionToolManager 猴子补丁
+- 插件禁用/启用 → PluginManager 猴子补丁
 """
 
 from __future__ import annotations
 
+import asyncio
+import inspect
 import json
+from collections.abc import AsyncGenerator
 from typing import Any
 
 from astrbot.api import logger, star
@@ -42,8 +45,6 @@ class Main(star.Star):
         self.context = context
         # Cached catalog: None means cache is stale
         self._catalog_cache: list[dict[str, Any]] | None = None
-        # Track whether monkey-patching has been applied (global, one-time)
-        self._patched = False
 
     async def initialize(self) -> None:
         from astrbot.core.provider.register import llm_tools
@@ -112,22 +113,26 @@ class Main(star.Star):
             "Plugin Toolifier: registered list_plugins, call_plugin, search_plugin_tools tools"
         )
 
-        # Monkey-patch method to intercept tool/ plugin state changes that
-        # do NOT trigger on_plugin_loaded / on_plugin_unloaded events.
+        # Monkey-patch AstrBot core methods to intercept tool/plugin state changes
+        # that do NOT emit on_plugin_loaded / on_plugin_unloaded events.
         self._monkey_patch()
 
     # ---- Monkey-patching for complete cache invalidation coverage ----
 
     def _monkey_patch(self) -> None:
-        """Patch FunctionToolManager and PluginManager methods.
+        """Patch FunctionToolManager and PluginManager methods for cache invalidation.
 
-        Covers the following scenarios that do NOT emit on_plugin_loaded /
-        on_plugin_unloaded events:
+        AstrBot's event system does not emit events for tool-level toggle or
+        plugin enable/disable operations. This method monkey-patches the relevant
+        methods so that every state mutation triggers cache invalidation.
 
-        1. Tool-level toggle: activate_llm_tool / deactivate_llm_tool
-           Called from WebUI (POST /api/tools/toggle)
+        Covered scenarios:
+        1. Tool toggle: activate_llm_tool / deactivate_llm_tool
+           (called from WebUI POST /api/tools/toggle)
         2. Plugin toggle: turn_on_plugin / turn_off_plugin
-           Called from WebUI (POST /api/plugin/on and /api/plugin/off)
+           (called from WebUI POST /api/plugin/on and /api/plugin/off)
+
+        Patches are applied once (tracked by _patched flag) to avoid duplication.
         """
         if self._patched:
             return
@@ -139,12 +144,14 @@ class Main(star.Star):
         _orig_deactivate = llm_tools.deactivate_llm_tool
 
         def _wrap_activate(name: str, star_map: dict) -> bool:
+            """Wrap activate_llm_tool to invalidate cache on success."""
             result = _orig_activate(name, star_map)
             if result:
                 self._invalidate_cache()
             return result
 
         def _wrap_deactivate(name: str) -> bool:
+            """Wrap deactivate_llm_tool to invalidate cache on success."""
             result = _orig_deactivate(name)
             if result:
                 self._invalidate_cache()
@@ -154,18 +161,20 @@ class Main(star.Star):
         llm_tools.deactivate_llm_tool = _wrap_deactivate
 
         # Patch 2: PluginManager.turn_on_plugin / turn_off_plugin
-        # These are async, so wrapped versions must also be async.
+        # These are async methods, so wrapped versions must also be async.
         from astrbot.core.star.star_manager import PluginManager
 
         _pm_orig_turn_off = PluginManager.turn_off_plugin
         _pm_orig_turn_on = PluginManager.turn_on_plugin
 
         async def _pm_wrap_turn_off(self_inst: PluginManager, plugin_name: str) -> None:
+            """Wrap turn_off_plugin to invalidate cache after the plugin is turned off."""
             await _pm_orig_turn_off(self_inst, plugin_name)
             self._invalidate_cache()
             logger.debug(f"Plugin {plugin_name} turned off, cleared discovery cache")
 
         async def _pm_wrap_turn_on(self_inst: PluginManager, plugin_name: str) -> None:
+            """Wrap turn_on_plugin to invalidate cache after the plugin is turned on."""
             await _pm_orig_turn_on(self_inst, plugin_name)
             self._invalidate_cache()
             logger.debug(f"Plugin {plugin_name} turned on, cleared discovery cache")
@@ -288,7 +297,13 @@ class Main(star.Star):
 
     # ---- Handlers for the three meta tools ----
 
-    async def _list_plugins_handler(self, event: AstrMessageEvent) -> str:
+    async def _list_plugins_handler(self) -> str:
+        """Return a formatted string listing all plugins with active LLM tools.
+
+        Does NOT accept an event parameter — the output is purely based on
+        the cached catalog and is used both by the Agent tool and the IM
+        command handler.
+        """
         catalog = self._build_plugin_catalog()
 
         if not catalog:
@@ -377,40 +392,103 @@ class Main(star.Star):
             return parsed_args
 
         try:
-            result = await func_tool.handler(event, **parsed_args)
-            if result is None:
-                return f"\u5de5\u5177 '{tool_name}' \u6267\u884c\u5b8c\u6210\u3002"
-            if hasattr(result, "message"):
-                return str(result.message)
-            return str(result)
+            return await self._invoke_func_tool(event, func_tool, parsed_args)
         except Exception as e:
             logger.exception("\u8c03\u7528\u63d2\u4ef6\u5de5\u5177\u5931\u8d25: %s", tool_name)
             return f"\u8c03\u7528\u63d2\u4ef6\u5de5\u5177 '{tool_name}' \u5931\u8d25: {e!s}"
+
+    async def _invoke_func_tool(
+        self,
+        event: AstrMessageEvent,
+        func_tool: Any,
+        kwargs: dict,
+    ) -> str:
+        """Invoke a FunctionTool handler, supporting both coroutine and async generator.
+
+        Returns the result as a string suitable for LLM tool output.
+        """
+        handler = func_tool.handler
+        if handler is None:
+            return f"\u5de5\u5177 '{func_tool.name}' \u6ca1\u6709\u5b9e\u73b0 handler\u3002"
+
+        # Check if handler is an async generator function
+        if inspect.isasyncgenfunction(handler):
+            # Async generator: iterate through yields
+            results = []
+            gen = handler(event, **kwargs)
+            try:
+                while True:
+                    try:
+                        chunk = await asyncio.wait_for(
+                            gen.__anext__(),
+                            timeout=30.0,
+                        )
+                        if chunk is not None:
+                            if hasattr(chunk, "message"):
+                                results.append(str(chunk.message))
+                            else:
+                                results.append(str(chunk))
+                    except StopAsyncIteration:
+                        break
+            except asyncio.TimeoutError:
+                return f"\u5de5\u5177 '{func_tool.name}' \u6267\u884c\u8d85\u65f6\u3002"
+            finally:
+                # Ensure the async generator is properly closed to clean up
+                # resources. If iteration stopped early (e.g. timeout),
+                # __aclose__ must be called explicitly.
+                gen.aclose()
+            if not results:
+                return f"\u5de5\u5177 '{func_tool.name}' \u6267\u884c\u5b8c\u6210\u3002"
+            return "\n".join(results)
+
+        # Regular coroutine
+        result = await handler(event, **kwargs)
+        if result is None:
+            return f"\u5de5\u5177 '{func_tool.name}' \u6267\u884c\u5b8c\u6210\u3002"
+        if hasattr(result, "message"):
+            return str(result.message)
+        return str(result)
 
     def _parse_args(self, parameters: dict, tool_args: str) -> dict | str:
         """Parse tool arguments.
 
         Supports:
-        - JSON format: '{"key": "value"}'
+        - JSON dict format: '{"key": "value"}'
+        - JSON list format: '["val1", "val2"]'
         - Simple string (assigned to the first parameter)
         - Empty string (returns empty dict)
         """
         if not tool_args or not tool_args.strip():
             return {}
 
+        # Try parsing as JSON dict
         try:
             parsed = json.loads(tool_args)
             if isinstance(parsed, dict):
-                return parsed
+                return self._validate_params(parsed, parameters)
+        except (json.JSONDecodeError, ValueError):
+            pass
+
+        # Try parsing as JSON list -> map to first parameter as list
+        try:
+            parsed = json.loads(tool_args)
+            if isinstance(parsed, list):
+                props = parameters.get("properties", {})
+                if props:
+                    first_key = next(iter(props), None)
+                    if first_key:
+                        return {first_key: parsed}
         except (json.JSONDecodeError, ValueError):
             pass
 
         stripped = tool_args.strip()
+        # Check for invalid JSON objects/arrays and give helpful errors
         if stripped.startswith("{") and stripped.endswith("}"):
             return f"\u53c2\u6570\u89e3\u6790\u5931\u8d25\uff0c\u8bf7\u68c0\u67e5 JSON \u683c\u5f0f: {tool_args}"
         if stripped.startswith("[") and stripped.endswith("]"):
             return f"\u53c2\u6570\u89e3\u6790\u5931\u8d25\uff0c\u8bf7\u68c0\u67e5 JSON \u683c\u5f0f: {tool_args}"
 
+        # Simple string -> assign to first parameter
         props = parameters.get("properties", {})
         if props:
             first_key = next(iter(props), None)
@@ -418,6 +496,20 @@ class Main(star.Star):
                 return {first_key: tool_args}
 
         return {}
+
+    @staticmethod
+    def _validate_params(parsed: dict, parameters: dict) -> dict:
+        """Validate and filter parsed parameters against the tool's parameter schema.
+
+        Only passes keys that exist in the tool's 'properties' definition,
+        preventing TypeError from unexpected keyword arguments.
+        """
+        allowed_keys = set(parameters.get("properties", {}).keys())
+        if not allowed_keys:
+            return parsed
+        # Keep only parameters that are defined in the tool schema
+        filtered = {k: v for k, v in parsed.items() if k in allowed_keys}
+        return filtered
 
     async def _search_plugin_tools_handler(
         self,
@@ -450,14 +542,14 @@ class Main(star.Star):
     @filter.command("list_plugins")
     async def cmd_list_plugins(self, event: AstrMessageEvent) -> None:
         """\u5217\u51fa\u6240\u6709\u63d0\u4f9b LLM \u5de5\u5177\u7684\u63d2\u4ef6"""
-        output = await self._list_plugins_handler(event)
+        output = await self._list_plugins_handler()
         event.set_result(event.message_chain.message(output).use_t2i(False))
 
     @filter.command("search_plugins")
     async def cmd_search_plugins(
         self, event: AstrMessageEvent, keywords: str = ""
     ) -> None:
-        """\u641c\u7d22\u63d0\u4f9b LLM \u5de5\u17f7\u5177\u7684\u63d2\u4ef6\u5de5\u5177"""
+        """\u641c\u7d22\u63d0\u4f9b LLM \u5de5\u5177\u7684\u63d2\u4ef6\u5de5\u5177"""
         if not keywords.strip():
             event.set_result(
                 event.message_chain.message("\u8bf7\u63d0\u4f9b\u641c\u7d22\u5173\u952e\u8bcd\uff0c\u4f8b\u5982\uff1a/search_plugins \u7ffb\u8bd1").use_t2i(False)
