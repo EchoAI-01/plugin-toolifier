@@ -37,7 +37,7 @@ class Main(star.Star):
     """
 
     author = "Chen"
-    name = "plugin_toolifier"
+    name = "astrbot_plugin_toolifier"
     desc = "插件工具化 — 自动将 AstrBot 插件注册为 LLM 工具，使 Agent 能发现、查询、调用所有插件的能力。"
 
     def __init__(self, context: star.Context) -> None:
@@ -69,6 +69,8 @@ class Main(star.Star):
             ),
             self._list_plugins_handler,
         )
+        # 设置 handler_module_path，确保工具与插件正确关联
+        llm_tools.func_list[-1].handler_module_path = "data.plugins.astrbot_plugin_toolifier.main"
 
         llm_tools.add_func(
             "call_plugin",
@@ -97,6 +99,7 @@ class Main(star.Star):
             ),
             self._call_plugin_handler,
         )
+        llm_tools.func_list[-1].handler_module_path = "data.plugins.astrbot_plugin_toolifier.main"
 
         llm_tools.add_func(
             "search_plugin_tools",
@@ -114,6 +117,7 @@ class Main(star.Star):
             ),
             self._search_plugin_tools_handler,
         )
+        llm_tools.func_list[-1].handler_module_path = "data.plugins.astrbot_plugin_toolifier.main"
 
         logger.info(
             "Plugin Toolifier: registered list_plugins, call_plugin, search_plugin_tools tools"
@@ -322,12 +326,11 @@ class Main(star.Star):
 
     # ---- Handlers for the three meta tools ----
 
-    async def _list_plugins_handler(self) -> str:
+    async def _list_plugins_handler(self, event: AstrMessageEvent) -> str:
         """Return a formatted string listing all plugins with active LLM tools.
 
-        Does NOT accept an event parameter — the output is purely based on
-        the cached catalog and is used both by the Agent tool and the IM
-        command handler.
+        The event parameter is required by AstrBot's tool execution system.
+        Used both by the Agent tool and the IM command handler.
         """
         catalog = self._build_plugin_catalog()
 
@@ -584,7 +587,7 @@ class Main(star.Star):
     @filter.command("list_plugins")
     async def cmd_list_plugins(self, event: AstrMessageEvent):
         """列出所有提供 LLM 工具的插件"""
-        output = await self._list_plugins_handler()
+        output = await self._list_plugins_handler(event)
         yield event.plain_result(output).use_t2i(False)
 
     @filter.command("search_plugins")
