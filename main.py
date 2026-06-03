@@ -29,8 +29,7 @@ from astrbot.api import logger
 from astrbot.api.all import Star, Context
 from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.star import StarMetadata
-from astrbot.core.star import star_map as _star_map
-from astrbot.core.star.star import star_registry
+from astrbot.core.star import star_map as _star_map, star_registry
 
 
 class Main(Star):
@@ -239,7 +238,6 @@ class Main(Star):
             return self._catalog_cache
 
         from astrbot.core.provider.register import llm_tools
-        from astrbot.core.star.star import star_map as _star_map
 
         catalog: dict[str, dict[str, Any]] = {}
 
