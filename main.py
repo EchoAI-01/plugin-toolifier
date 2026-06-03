@@ -227,8 +227,9 @@ class Main(Star):
     def _build_plugin_catalog(self) -> list[dict[str, Any]]:
         """Build a catalog of all loaded plugins that expose active LLM tools.
 
-        Only scans plugins that have registered @llm_tool decorated functions.
-        Pure helper plugins (e.g. message formatting, segmented reply) are excluded.
+        Scans both func_list (for tools with handler_module_path set) AND
+        star_handlers_registry (for tools registered via @llm_tool decorator
+        whose handler_module_path may be None after functools.partial wrapping).
 
         Uses event-driven cache: cache is rebuilt only when stale (plugin loaded,
         unloaded, tool activated/deactivated, or plugin turned on/off).
@@ -237,6 +238,8 @@ class Main(Star):
             return self._catalog_cache
 
         from astrbot.core.provider.register import llm_tools
+        from astrbot.core.star.register.star_handler import EventType
+        from astrbot.core.star.star_handler import star_handlers_registry
 
         catalog: dict[str, dict[str, Any]] = {}
 
@@ -257,21 +260,62 @@ class Main(Star):
                     "commands": [],
                 }
 
-        # 2. Collect LLM Tools from func_list (excludes builtin tools)
+        # 2. Collect LLM Tools from func_list.
+        #    We track which func_tools we've already added to avoid duplicates.
+        added_func_tools: set[int] = set()
+
         for func_tool in llm_tools.func_list:
-            # Only include active tools -- inactive ones are hidden from the Agent
-            if not getattr(func_tool, "active", True):
-                continue
             mp = getattr(func_tool, "handler_module_path", None)
-            if not mp:
+
+            # Collect active tools from func_list
+            if getattr(func_tool, "active", True):
+                if mp:
+                    # 2a. Tool with explicit handler_module_path (builtin or set by toolifier)
+                    meta = _star_map.get(mp)
+                    if meta and meta.name:
+                        name_key = meta.module_path or mp
+                        if name_key not in catalog:
+                            catalog[name_key] = {
+                                "name": meta.name,
+                                "author": meta.author,
+                                "desc": meta.desc,
+                                "version": meta.version,
+                                "activated": meta.activated,
+                                "reserved": getattr(meta, "reserved", False),
+                                "tools": [],
+                                "commands": [],
+                            }
+                        catalog[name_key]["tools"].append({
+                            "name": func_tool.name,
+                            "description": func_tool.description or "",
+                            "parameters": func_tool.parameters or {},
+                        })
+                else:
+                    # 2b. Tool without handler_module_path (likely our own tools).
+                    #     Skip here; we don't list our own tools as targets.
+                    pass
+
+        # 2c. Collect LLM Tools from star_handlers_registry.
+        #     The @llm_tool decorator creates a handler with type OnCallingFuncToolEvent.
+        #     Its handler.__func__ (before functools.partial wrapping) has __module__
+        #     pointing to the plugin's module_path. We use this to map tools to plugins.
+        for handler_md in star_handlers_registry:
+            if handler_md.event_type != EventType.OnCallingFuncToolEvent:
+                continue
+            handler_func = getattr(handler_md.handler, "func", handler_md.handler)
+            module_path = getattr(handler_func, "__module__", None)
+            if not module_path:
                 continue
 
-            # Find the owning plugin
-            meta = _star_map.get(mp)
+            meta = _star_map.get(module_path)
             if not meta or not meta.name:
                 continue
 
-            name_key = meta.module_path or mp
+            # Skip if the owning plugin is inactive
+            if not meta.activated and not getattr(meta, "reserved", False):
+                continue
+
+            name_key = meta.module_path or module_path
             if name_key not in catalog:
                 catalog[name_key] = {
                     "name": meta.name,
@@ -284,14 +328,18 @@ class Main(Star):
                     "commands": [],
                 }
 
+            # Check if we already added this tool name (from func_list)
+            tool_name = handler_md.handler_name
+            if any(t["name"] == tool_name for t in catalog[name_key]["tools"]):
+                continue
+
             catalog[name_key]["tools"].append({
-                "name": func_tool.name,
-                "description": func_tool.description or "",
-                "parameters": func_tool.parameters or {},
+                "name": tool_name,
+                "description": handler_md.desc or "",
+                "parameters": {},
             })
 
         # 3. Collect command info from handler registry
-        from astrbot.core.star.star_handler import star_handlers_registry
         for handler_md in star_handlers_registry:
             mp = handler_md.handler_module_path
             if not mp:
@@ -312,7 +360,6 @@ class Main(Star):
                         catalog[name_key]["commands"].append(cmd)
 
         # 4. Filter: only include active plugins that have at least one tool
-        #    Inactive non-reserved plugins are excluded entirely.
         result = []
         for info in catalog.values():
             if not info["activated"] and not info["reserved"]:
@@ -373,6 +420,8 @@ class Main(Star):
         tool_args: str = "",
     ) -> str:
         from astrbot.core.provider.register import llm_tools
+        from astrbot.core.star.register.star_handler import EventType
+        from astrbot.core.star.star_handler import star_handlers_registry
 
         catalog = self._build_plugin_catalog()
 
@@ -425,16 +474,54 @@ class Main(Star):
                 tool_names = [t["name"] for t in plugin_info["tools"]]
                 return f"插件 '{plugin_info['name']}' 中未找到工具 '{tool_name}'。\n可用工具: {', '.join(tool_names)}"
 
-        func_tool = llm_tools.get_func(tool_info["name"])
-        if not func_tool or not func_tool.active:
-            return f"工具 '{tool_name}' 未激活或不存在。"
+        # Resolve the actual FunctionTool by matching both name AND handler_module_path
+        # This ensures we call the right plugin's tool when multiple plugins share the same name.
+        from astrbot.core.star import star_map
 
-        parsed_args = self._parse_args(tool_info["parameters"], tool_args)
+        target_func_tool = None
+        target_params = {}
+        for ft in llm_tools.func_list:
+            if ft.name != tool_name:
+                continue
+            if not getattr(ft, "active", True):
+                continue
+            mp = getattr(ft, "handler_module_path", None)
+            if mp and mp in star_map:
+                if star_map[mp].name == plugin_info["name"]:
+                    target_func_tool = ft
+                    target_params = ft.parameters or {}
+                    break
+
+        # Fallback: if handler_module_path is None, search by handler.__module__
+        if target_func_tool is None:
+            for handler_md in star_handlers_registry:
+                if handler_md.handler_name != tool_name:
+                    continue
+                handler_func = getattr(handler_md.handler, "func", handler_md.handler)
+                module_path = getattr(handler_func, "__module__", None)
+                if module_path and module_path in star_map:
+                    if star_map[module_path].name == plugin_info["name"]:
+                        # Try to find matching func_tool
+                        for ft in llm_tools.func_list:
+                            if ft.name == tool_name and getattr(ft, "active", True):
+                                target_func_tool = ft
+                                target_params = ft.parameters or {}
+                                break
+                        break
+
+        if target_func_tool is None:
+            # Fallback to the old get_func behavior
+            target_func_tool = llm_tools.get_func(tool_name)
+            if target_func_tool is None or not getattr(target_func_tool, "active", True):
+                return f"工具 '{tool_name}' 未激活或不存在。"
+            target_params = target_func_tool.parameters or {}
+
+        parsed_args = self._parse_args(target_params, tool_args)
         if isinstance(parsed_args, str):
             return parsed_args
 
         try:
-            return await self._invoke_func_tool(event, func_tool, parsed_args)
+            return await self._invoke_func_tool(event, target_func_tool, parsed_args)
         except Exception as e:
             logger.exception("调用插件工具失败: %s", tool_name)
             return f"调用插件工具 '{tool_name}' 失败: {e!s}"
