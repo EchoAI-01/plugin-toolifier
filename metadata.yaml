@@ -1,5 +1,7 @@
 name: astrbot_plugin_toolifier
 author: Chen
+display_name: Plugin Toolifier
+short_desc: 自动将 AstrBot 插件注册为 LLM 工具，使 Agent 能发现、查询、调用所有插件的能力
 desc: 插件工具化 — 自动将 AstrBot 插件注册为 LLM 工具，使 Agent 能发现、查询、调用所有插件的能力。
 version: "1.0.0"
 repo: https://github.com/EchoAI-01/plugin_toolifier

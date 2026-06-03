@@ -25,11 +25,15 @@ import inspect
 import json
 from typing import Any
 
-from astrbot.api import logger, star
+from astrbot.api import logger
+from astrbot.api.all import Star, Context
 from astrbot.api.event import AstrMessageEvent, filter
+from astrbot.api.star import StarMetadata
+from astrbot.core.star import star_map as _star_map
+from astrbot.core.star.star import star_registry
 
 
-class Main(star.Star):
+class Main(Star):
     """Agent 插件发现插件。
 
     自动将所有已加载插件的 LLM Tool 暴露给 Agent，
@@ -40,13 +44,12 @@ class Main(star.Star):
     name = "astrbot_plugin_toolifier"
     desc = "插件工具化 — 自动将 AstrBot 插件注册为 LLM 工具，使 Agent 能发现、查询、调用所有插件的能力。"
 
-    def __init__(self, context: star.Context) -> None:
+    def __init__(self, context: Context) -> None:
         self.context = context
         # Cached catalog: None means cache is stale
         self._catalog_cache: list[dict[str, Any]] | None = None
-        # P0-1: Initialize _patched flag
         self._patched = False
-        # P1-2 / P0-2: Store original references for patch restoration
+        # Store original references for patch restoration
         self._orig_activate: Any = None
         self._orig_deactivate: Any = None
         self._orig_pm_turn_off: Any = None
@@ -127,7 +130,7 @@ class Main(star.Star):
         # that do NOT emit on_plugin_loaded / on_plugin_unloaded events.
         self._monkey_patch()
 
-    # P0-2: Lifecycle cleanup to restore monkey patches
+    # Lifecycle cleanup to restore monkey patches
     async def terminate(self) -> None:
         """插件卸载/停用时还原猴子补丁。"""
         # Restore FunctionToolManager patches
@@ -167,7 +170,7 @@ class Main(star.Star):
         # Patch 1: FunctionToolManager.activate_llm_tool / deactivate_llm_tool
         from astrbot.core.provider.register import llm_tools
 
-        # P1-2: Save original references to instance attributes for restore
+        # Save original references to instance attributes for restore
         self._orig_activate = llm_tools.activate_llm_tool
         self._orig_deactivate = llm_tools.deactivate_llm_tool
 
@@ -192,7 +195,7 @@ class Main(star.Star):
         # These are async methods, so wrapped versions must also be async.
         from astrbot.core.star.star_manager import PluginManager
 
-        # P1-2: Save original references
+        # Save original references
         self._orig_pm_turn_off = PluginManager.turn_off_plugin
         self._orig_pm_turn_on = PluginManager.turn_on_plugin
 
@@ -241,7 +244,7 @@ class Main(star.Star):
         catalog: dict[str, dict[str, Any]] = {}
 
         # 1. Collect plugin basic info from star_registry
-        for metadata in star.star_registry:
+        for metadata in star_registry:
             key = metadata.module_path
             if not key:
                 continue
@@ -252,7 +255,7 @@ class Main(star.Star):
                     "desc": metadata.desc,
                     "version": metadata.version,
                     "activated": metadata.activated,
-                    "reserved": metadata.reserved,
+                    "reserved": getattr(metadata, "reserved", False),
                     "tools": [],
                     "commands": [],
                 }
@@ -400,7 +403,7 @@ class Main(star.Star):
             else:
                 return f"未找到插件 '{plugin_name}'。请使用 `list_plugins` 查看提供 LLM 工具的插件。"
 
-        # 工具只精确匹配
+        # 工具名匹配：精确匹配 > 大小写不敏感匹配 > 子串匹配
         tool_info = None
         for t in plugin_info["tools"]:
             if t["name"] == tool_name:
@@ -408,8 +411,22 @@ class Main(star.Star):
                 break
 
         if not tool_info:
-            tool_names = [t["name"] for t in plugin_info["tools"]]
-            return f"插件 '{plugin_info['name']}' 中未找到工具 '{tool_name}'。\n可用工具: {', '.join(tool_names)}"
+            for t in plugin_info["tools"]:
+                if t["name"].lower() == tool_name.lower():
+                    tool_info = t
+                    break
+
+        if not tool_info:
+            matches = [
+                t for t in plugin_info["tools"]
+                if tool_name.lower() in t["name"].lower()
+            ]
+            if matches:
+                tool_info = matches[0]
+                tool_name = tool_info["name"]
+            else:
+                tool_names = [t["name"] for t in plugin_info["tools"]]
+                return f"插件 '{plugin_info['name']}' 中未找到工具 '{tool_name}'。\n可用工具: {', '.join(tool_names)}"
 
         func_tool = llm_tools.get_func(tool_info["name"])
         if not func_tool or not func_tool.active:
@@ -461,7 +478,7 @@ class Main(star.Star):
             except asyncio.TimeoutError:
                 return f"工具 '{func_tool.name}' 执行超时。"
             finally:
-                # P1-5: Guard aclose() against None or missing attribute
+                # Guard aclose() against None or missing attribute
                 if gen is not None and hasattr(gen, "aclose"):
                     gen.aclose()
             if not results:
@@ -488,6 +505,20 @@ class Main(star.Star):
         if not tool_args or not tool_args.strip():
             return {}
 
+        # Normalize parameters: handle both OpenAI style ({properties, required})
+        # and AstrBot decorator style ({type, name, description})
+        props = parameters.get("properties", {})
+        if not props:
+            # Some tools may use a different schema format (e.g. list of dicts)
+            # Check if parameters is already a list of parameter definitions
+            if isinstance(parameters, list):
+                if parameters:
+                    first_param = parameters[0]
+                    first_key = first_param.get("name", "arg")
+                    return {first_key: tool_args.strip()}
+                return {}
+            return {}
+
         # Try parsing as JSON dict
         try:
             parsed = json.loads(tool_args)
@@ -500,7 +531,6 @@ class Main(star.Star):
         try:
             parsed = json.loads(tool_args)
             if isinstance(parsed, list):
-                props = parameters.get("properties", {})
                 if props:
                     first_key = next(iter(props), None)
                     if first_key:
@@ -515,28 +545,26 @@ class Main(star.Star):
         if stripped.startswith("[") and stripped.endswith("]"):
             return f"参数解析失败，请检查 JSON 格式: {tool_args}"
 
-        # Simple string -> assign to first parameter with type coercion (P1-4)
-        props = parameters.get("properties", {})
-        if props:
-            first_key = next(iter(props), None)
-            if first_key:
-                prop_schema = props.get(first_key, {})
-                prop_type = prop_schema.get("type", "")
-                value = tool_args
-                # P1-4: Type coercion for string fallback
-                if prop_type == "int":
-                    try:
-                        value = int(tool_args)
-                    except ValueError:
-                        pass
-                elif prop_type == "float":
-                    try:
-                        value = float(tool_args)
-                    except ValueError:
-                        pass
-                elif prop_type == "bool":
-                    value = tool_args.lower() in ("true", "yes", "1")
-                return {first_key: value}
+        # Simple string -> assign to first parameter with type coercion
+        first_key = next(iter(props), None)
+        if first_key:
+            prop_schema = props.get(first_key, {})
+            prop_type = prop_schema.get("type", "")
+            value = tool_args
+            # Type coercion for string fallback
+            if prop_type == "int":
+                try:
+                    value = int(tool_args)
+                except ValueError:
+                    pass
+            elif prop_type == "float":
+                try:
+                    value = float(tool_args)
+                except ValueError:
+                    pass
+            elif prop_type == "bool":
+                value = tool_args.lower() in ("true", "yes", "1")
+            return {first_key: value}
 
         return {}
 
@@ -561,7 +589,6 @@ class Main(star.Star):
     ) -> str:
         catalog = self._build_plugin_catalog()
 
-        # P2-2: Renamed variable for clarity (Chinese chars have no case)
         keywords_normalized = keywords.lower()
         results = []
         for info in catalog:
@@ -583,7 +610,6 @@ class Main(star.Star):
 
     # ---- IM command handlers ----
 
-    # P1-3: Unified to use yield event.plain_result() style
     @filter.command("list_plugins")
     async def cmd_list_plugins(self, event: AstrMessageEvent):
         """列出所有提供 LLM 工具的插件"""
@@ -605,13 +631,13 @@ class Main(star.Star):
     # ---- Cache invalidation hooks ----
 
     @filter.on_plugin_loaded()
-    async def _on_plugin_loaded(self, metadata: star.StarMetadata) -> None:
+    async def _on_plugin_loaded(self, metadata: StarMetadata) -> None:
         """插件加载后自动清除缓存"""
         self._invalidate_cache()
         logger.debug(f"Plugin {metadata.name} loaded, cleared discovery cache")
 
     @filter.on_plugin_unloaded()
-    async def _on_plugin_unloaded(self, metadata: star.StarMetadata) -> None:
+    async def _on_plugin_unloaded(self, metadata: StarMetadata) -> None:
         """插件卸载后自动清除缓存"""
         self._invalidate_cache()
         logger.debug(f"Plugin {metadata.name} unloaded, cleared discovery cache")
