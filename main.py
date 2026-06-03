@@ -28,7 +28,6 @@ from typing import Any
 from astrbot.api import logger
 from astrbot.api.all import Star, Context
 from astrbot.api.event import AstrMessageEvent, filter
-from astrbot.api.star import StarMetadata
 from astrbot.core.star import star_map as _star_map, star_registry
 
 
@@ -629,13 +628,13 @@ class Main(Star):
     # ---- Cache invalidation hooks ----
 
     @filter.on_plugin_loaded()
-    async def _on_plugin_loaded(self, metadata: StarMetadata) -> None:
+    async def _on_plugin_loaded(self, metadata) -> None:
         """插件加载后自动清除缓存"""
         self._invalidate_cache()
         logger.debug(f"Plugin {metadata.name} loaded, cleared discovery cache")
 
     @filter.on_plugin_unloaded()
-    async def _on_plugin_unloaded(self, metadata: StarMetadata) -> None:
+    async def _on_plugin_unloaded(self, metadata) -> None:
         """插件卸载后自动清除缓存"""
         self._invalidate_cache()
         logger.debug(f"Plugin {metadata.name} unloaded, cleared discovery cache")
