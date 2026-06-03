@@ -44,8 +44,8 @@ class Main(Star):
     name = "astrbot_plugin_toolifier"
     desc = "插件工具化 — 自动将 AstrBot 插件注册为 LLM 工具，使 Agent 能发现、查询、调用所有插件的能力。"
 
-    def __init__(self, context: Context) -> None:
-        self.context = context
+    def __init__(self, context: Context, config: dict = None) -> None:
+        super().__init__(context, config)
         # Cached catalog: None means cache is stale
         self._catalog_cache: list[dict[str, Any]] | None = None
         self._patched = False
