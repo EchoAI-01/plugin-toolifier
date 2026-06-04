@@ -28,7 +28,12 @@ from typing import Any
 from astrbot.api import logger
 from astrbot.api.all import Star, Context
 from astrbot.api.event import AstrMessageEvent, filter
+import time
+import uuid
+
 from astrbot.core.star import star_map as _star_map, star_registry
+from astrbot.core.message.message_event_result import MessageEventResult
+from astrbot.core.message.components import Plain
 
 
 class Main(Star):
@@ -246,27 +251,18 @@ class Main(Star):
 
         catalog: dict[str, dict[str, Any]] = {}
 
-        # 1. Collect plugin basic info from star_registry (for plugins that may have
-        #    commands but no LLM tools -- they'll be filtered out later)
+        # Build a mapping from module_path prefix to plugin metadata.
+        # This handles both main module (e.g. "data.plugins.xxx.main")
+        # and sub-modules (e.g. "data.plugins.xxx.tools.search") since
+        # star_map only has the main module key.
+        prefix_map: dict[str, Any] = {}
         for metadata in star_registry:
-            key = metadata.module_path
-            if not key:
+            mp = metadata.module_path
+            if not mp:
                 continue
-            catalog[key] = {
-                "name": metadata.name or key.split(".")[-1],
-                "author": metadata.author,
-                "desc": metadata.desc,
-                "version": metadata.version,
-                "activated": metadata.activated,
-                "reserved": getattr(metadata, "reserved", False),
-                "tools": [],
-                "commands": [],
-            }
+            prefix_map[mp] = metadata
 
-        # 2. Collect LLM Tools from star_handlers_registry.
-        #    This is the single reliable source: OnCallingFuncToolEvent handlers
-        #    are created by the @llm_tool decorator. handler_module_path is set
-        #    at decoration time and never changed by functools.partial wrapping.
+        # 1. Collect LLM Tools from star_handlers_registry.
         for handler_md in star_handlers_registry:
             if handler_md.event_type != EventType.OnCallingFuncToolEvent:
                 continue
@@ -275,7 +271,27 @@ class Main(Star):
             if not mp:
                 continue
 
-            meta = _star_map.get(mp)
+            # Find the owning plugin via prefix match.
+            # The handler_module_path might be a sub-module like
+            # "data.plugins.xxx.tools.search", while star_map only has
+            # "data.plugins.xxx.main". We need to find the best matching
+            # prefix: longest matching prefix first, then fall back to
+            # checking if mp starts with any known prefix.
+            meta: Any = None
+            # First try exact match
+            if mp in prefix_map:
+                meta = prefix_map[mp]
+            else:
+                # Try prefix match: find the longest known prefix that mp starts with
+                best_match = ""
+                for known_mp, known_meta in prefix_map.items():
+                    if mp.startswith(known_mp + ".") and len(known_mp) > len(best_match):
+                        best_match = known_mp
+                        meta = known_meta
+                    elif mp == known_mp:
+                        meta = known_meta
+                        break
+
             if not meta or not meta.name:
                 continue
 
@@ -292,6 +308,7 @@ class Main(Star):
                     "version": meta.version,
                     "activated": meta.activated,
                     "reserved": getattr(meta, "reserved", False),
+                    "_module_path": meta.module_path,  # for call_plugin precise matching
                     "tools": [],
                     "commands": [],
                 }
@@ -315,12 +332,23 @@ class Main(Star):
                 "parameters": params,
             })
 
-        # 3. Collect command info from handler registry
+        # 2. Collect command info from handler registry
         for handler_md in star_handlers_registry:
             mp = handler_md.handler_module_path
             if not mp:
                 continue
-            meta = _star_map.get(mp)
+
+            # Same prefix matching for commands
+            meta: Any = None
+            if mp in prefix_map:
+                meta = prefix_map[mp]
+            else:
+                best_match = ""
+                for known_mp, known_meta in prefix_map.items():
+                    if mp.startswith(known_mp + ".") and len(known_mp) > len(best_match):
+                        best_match = known_mp
+                        meta = known_meta
+
             if not meta or not meta.name:
                 continue
             name_key = meta.module_path or mp
@@ -335,7 +363,88 @@ class Main(Star):
                     if cmd not in catalog[name_key]["commands"]:
                         catalog[name_key]["commands"].append(cmd)
 
-        # 4. Filter: only include plugins that have at least one tool
+        # 4. Discover @filter.command handlers and expose them as LLM tools.
+        #    This bridges the gap: most AstrBot plugins register @filter.command
+        #    (not @llm_tool), so they are invisible to the Agent. Here we wrap
+        #    each command handler into a catalog entry that Agent can call via
+        #    call_plugin with tool_name "cmd_<command_name>".
+        for handler_md in star_handlers_registry:
+            # Only process AdapterMessageEvent handlers (i.e. command/event handlers)
+            if handler_md.event_type != EventType.AdapterMessageEvent:
+                continue
+
+            mp = handler_md.handler_module_path
+            if not mp:
+                continue
+
+            # Prefix match for sub-module handlers
+            meta: Any = None
+            if mp in prefix_map:
+                meta = prefix_map[mp]
+            else:
+                best_match = ""
+                for known_mp, known_meta in prefix_map.items():
+                    if mp.startswith(known_mp + ".") and len(known_mp) > len(best_match):
+                        best_match = known_mp
+                        meta = known_meta
+
+            if not meta or not meta.name:
+                continue
+
+            # Skip if the owning plugin is inactive (unless reserved)
+            if not meta.activated and not getattr(meta, "reserved", False):
+                continue
+
+            name_key = meta.module_path or mp
+            if name_key not in catalog:
+                catalog[name_key] = {
+                    "name": meta.name,
+                    "author": meta.author,
+                    "desc": meta.desc,
+                    "version": meta.version,
+                    "activated": meta.activated,
+                    "reserved": getattr(meta, "reserved", False),
+                    "_module_path": meta.module_path,
+                    "tools": [],
+                    "commands": [],
+                }
+
+            # Find CommandFilter in event filters
+            for ef in handler_md.event_filters:
+                if not hasattr(ef, "command_name"):
+                    continue
+                cmd_name = ef.command_name
+                parent_names = getattr(ef, "parent_command_names", None) or []
+                for pn in parent_names:
+                    if pn:
+                        cmd_name = f"{pn} {cmd_name}"
+
+                # Build function args schema from handler_params
+                func_args = _build_func_args_from_command(ef)
+
+                # Tool name prefixed with "cmd_" to distinguish from @llm_tool
+                tool_name = f"cmd_{cmd_name}"
+
+                # Skip duplicate tools
+                if any(t["name"] == tool_name for t in catalog[name_key]["tools"]):
+                    continue
+
+                catalog[name_key]["tools"].append({
+                    "name": tool_name,
+                    "description": handler_md.desc or f"Execute the command /{cmd_name}",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            p["name"]: p for p in func_args
+                        },
+                        "required": [p["name"] for p in func_args if p.get("required", False)],
+                    },
+                    "_handler_md": handler_md,
+                    "_cmd_filter": ef,
+                    "_is_command": True,
+                })
+
+        # 5. Filter: only include plugins that have at least one tool
         result = []
         for info in catalog.values():
             if not info["activated"] and not info["reserved"]:
@@ -346,6 +455,92 @@ class Main(Star):
 
         self._catalog_cache = result
         return result
+
+# ---- Helper functions for command tool exposure ----
+
+def _build_func_args_from_command(cmd_filter) -> list[dict]:
+    """Convert command handler parameters to JSON Schema parameter list.
+    
+    Reads from CommandFilter.handler_params which maps param_name -> 
+    type_or_default_value.
+    """
+    import types
+    import typing
+    
+    args = []
+    for param_name, type_or_default in cmd_filter.handler_params.items():
+        param_info = {"name": param_name}
+        
+        if isinstance(type_or_default, type):
+            # Type annotation (e.g. str, int)
+            type_map = {"str": "string", "int": "integer", "float": "number", "bool": "boolean"}
+            param_info["type"] = type_map.get(type_or_default.__name__, "string")
+            param_info["required"] = True
+        elif isinstance(type_or_default, types.UnionType) or typing.get_origin(type_or_default) is typing.Union:
+            # Optional[T] etc
+            param_info["type"] = "string"
+            param_info["required"] = False
+        else:
+            # Has default value
+            param_info["type"] = "string"
+            param_info["required"] = False
+        
+        param_info["description"] = f"Parameter: {param_name}"
+        args.append(param_info)
+    
+    return args
+
+
+def _extract_text(result) -> str:
+    """Extract plain text from various handler result types."""
+    if isinstance(result, str):
+        return result
+    if isinstance(result, MessageEventResult):
+        parts = []
+        for comp in (result.chain or []):
+            if hasattr(comp, "text"):
+                parts.append(comp.text)
+            else:
+                parts.append(str(comp))
+        return "\n".join(parts)
+    if hasattr(result, "message"):
+        return str(result.message)
+    return str(result)
+
+
+def _create_fake_event(
+    message_str: str,
+    original_event: AstrMessageEvent,
+) -> AstrMessageEvent:
+    """Create a minimal AstrMessageEvent for command invocation.
+    
+    This simulates a user sending the command text directly to the bot,
+    allowing command handlers to work without modification.
+    """
+    from astrbot.core.platform.astrbot_message import AstrBotMessage, MessageMember
+    from astrbot.core.platform.message_type import MessageType
+    from astrbot.core.platform.sources.webchat.webchat_event import WebChatMessageEvent
+    
+    msg = AstrBotMessage()
+    msg.type = MessageType.FRIEND_MESSAGE
+    msg.self_id = original_event.get_self_id()
+    msg.session_id = original_event.session_id
+    msg.message_id = f"toolifier_{uuid.uuid4().hex[:8]}"
+    msg.sender = MessageMember(
+        user_id=original_event.get_sender_id() or "toolifier_agent",
+        nickname="Agent",
+    )
+    msg.message = [Plain(message_str)]
+    msg.message_str = message_str
+    msg.timestamp = int(time.time())
+    
+    fake_event = WebChatMessageEvent(
+        message_str, msg, original_event.platform_meta, original_event.session_id
+    )
+    fake_event.is_wake = True
+    fake_event.is_at_or_wake_command = True
+    return fake_event
+
 
     # ---- Handlers for the three meta tools ----
 
@@ -453,29 +648,44 @@ class Main(Star):
         # Resolve the actual FunctionTool by matching both name AND module_path.
         # Use star_handlers_registry for precise matching (handler_module_path
         # is fixed at decoration time and not affected by functools.partial).
-        target_ft = None
-        for handler_md in star_handlers_registry:
-            if handler_md.event_type != EventType.OnCallingFuncToolEvent:
-                continue
-            if handler_md.handler_name != tool_name:
-                continue
-            mp = handler_md.handler_module_path
-            if not mp:
-                continue
-            if mp in _star_map and _star_map[mp].name == plugin_info["name"]:
-                # Found the matching handler; now find the corresponding func_tool
-                for ft in llm_tools.func_list:
-                    if ft.name == tool_name and getattr(ft, "active", True):
-                        target_ft = ft
-                        break
+        # Supports prefix match for sub-module handlers.
+        target_module_path: str | None = None
+        for info in catalog:
+            if info["name"] == plugin_info["name"]:
+                target_module_path = info.get("_module_path")
                 break
 
-        if target_ft is None:
-            return f"工具 '{tool_name}' 所属的插件工具未注册。"
+        target_ft = None
+        if target_module_path:
+            for handler_md in star_handlers_registry:
+                if handler_md.event_type != EventType.OnCallingFuncToolEvent:
+                    continue
+                if handler_md.handler_name != tool_name:
+                    continue
+                mp = handler_md.handler_module_path
+                if not mp:
+                    continue
+                if mp == target_module_path or mp.startswith(target_module_path + "."):
+                    for ft in llm_tools.func_list:
+                        if ft.name == tool_name and getattr(ft, "active", True):
+                            target_ft = ft
+                            break
+                    break
 
         parsed_args = self._parse_args(tool_info["parameters"], tool_args)
         if isinstance(parsed_args, str):
             return parsed_args
+
+        if target_ft is None:
+            # Check if this is a command tool (cmd_ prefix)
+            if tool_name.startswith("cmd_") and "_is_command" in tool_info:
+                handler_md = tool_info.get("_handler_md")
+                cmd_filter = tool_info.get("_cmd_filter")
+                if handler_md and cmd_filter:
+                    return await self._invoke_command_handler(
+                        event, handler_md, cmd_filter, parsed_args,
+                    )
+            return f"工具 '{tool_name}' 所属的插件工具未注册。"
 
         try:
             return await self._invoke_func_tool(event, target_ft, parsed_args)
@@ -533,6 +743,65 @@ class Main(Star):
         if hasattr(result, "message"):
             return str(result.message)
         return str(result)
+
+    async def _invoke_command_handler(
+        self,
+        event: AstrMessageEvent,
+        handler_md: Any,
+        cmd_filter: Any,
+        parsed_args: dict,
+    ) -> str:
+        """Invoke a command handler by simulating a message event.
+        
+        Builds a fake message like "/command_name arg1 arg2", creates a
+        minimal WebChatMessageEvent, and calls the handler directly.
+        """
+        # Build fake message string: /cmd arg1 arg2 ...
+        cmd_parts = [cmd_filter.command_name]
+        for k, v in parsed_args.items():
+            if isinstance(v, list):
+                cmd_parts.append(" ".join(str(x) for x in v))
+            elif isinstance(v, dict):
+                cmd_parts.append(json.dumps(v))
+            else:
+                cmd_parts.append(str(v))
+        fake_message = " ".join(cmd_parts)
+        
+        # Create simulated event
+        fake_event = _create_fake_event(fake_message, event)
+        
+        # Call the handler
+        handler = handler_md.handler
+        try:
+            if inspect.isasyncgenfunction(handler):
+                # Async generator (yields MessageEventResult)
+                results = []
+                gen = handler(fake_event, **parsed_args)
+                try:
+                    while True:
+                        try:
+                            chunk = await asyncio.wait_for(
+                                gen.__anext__(), timeout=30.0,
+                            )
+                            results.append(_extract_text(chunk))
+                        except asyncio.TimeoutError:
+                            return f"命令 '{cmd_filter.command_name}' 执行超时。"
+                        except StopAsyncIteration:
+                            break
+                finally:
+                    if hasattr(gen, "aclose"):
+                        gen.aclose()
+                return "\n".join(results) if results else "命令执行完成。"
+            else:
+                # Regular async function
+                result = await handler(fake_event, **parsed_args)
+                if result is None:
+                    return "命令执行完成。"
+                return _extract_text(result)
+        except Exception as e:
+            logger.exception("命令执行失败: %s", cmd_filter.command_name)
+            return f"命令 '{cmd_filter.command_name}' 执行失败: {e!s}"
+
 
     def _parse_args(self, parameters: dict, tool_args: str) -> dict | str:
         """Parse tool arguments.
