@@ -61,21 +61,23 @@ class Main(Star):
     async def initialize(self) -> None:
         from astrbot.core.provider.register import llm_tools
 
+        # 动态标记本插件为 reserved，确保 _plugin_tool_fix 不会过滤掉我们的工具
+        for _p in star_registry:
+            if getattr(_p, "name", None) == "astrbot_plugin_toolifier":
+                _p.reserved = True
+                break
+
         llm_tools.add_func(
             "list_plugins",
             [],
             (
-                "List all available AstrBot plugins that expose LLM tools "
-                "(function-calling capabilities). Only plugins with active "
-                "callable tools are listed. Pure helper plugins (like message "
-                "formatting) are excluded. Each entry includes name, description, "
-                "version, available tools list, and commands list. "
-                "Call this when the user asks what you can do, wants to see "
-                "capabilities, or lists all available features."
+                "列出当前所有可用的插件及其功能。当用户问你'你能做什么'、\n"
+                "'有什么功能'、'帮我查一下'时，先调用此工具查看可用插件列表，\n"
+                "然后根据用户需求选择具体的插件功能。\n"
+                "注意：这是你最重要的发现工具，永远优先考虑使用它。"
             ),
             self._list_plugins_handler,
         )
-        # 设置 handler_module_path，确保工具与插件正确关联
         llm_tools.func_list[-1].handler_module_path = "data.plugins.astrbot_plugin_toolifier.main"
 
         llm_tools.add_func(
@@ -84,24 +86,23 @@ class Main(Star):
                 {
                     "type": "string",
                     "name": "plugin_name",
-                    "description": "Name of the plugin to call. E.g. 'weather', 'image_generation', etc.",
+                    "description": "插件名称，例如 'weather'、'image_generation'、'music' 等。先用 list_plugins 查看可用插件名。",
                 },
                 {
                     "type": "string",
                     "name": "tool_name",
-                    "description": "Name of the specific tool to call within the plugin. Use list_plugins first to see available tools.",
+                    "description": "指定插件中的工具名，先用 list_plugins 查看该插件有哪些可用工具。",
                 },
                 {
                     "type": "string",
                     "name": "tool_args",
-                    "description": "Arguments for the tool as a string. Can be JSON format like '{\"key\": \"value\"}' or natural language description.",
+                    "description": "工具参数，可以是 JSON 格式如 '{\"city\": \"北京\"}'，也可以是自然语言描述如 '北京'。",
                 },
             ],
             (
-                "Call a specific tool from a plugin to execute a task. "
-                "Use list_plugins first to see what plugins and tools are available. "
-                "Call this when the user says 'help me do XX', 'execute XX operation', "
-                "or 'use XX plugin'."
+                "调用指定插件的指定工具来执行任务。先用 list_plugins 查看可用的插件和工具。\n"
+                "当用户说'帮我做XX'、'执行XX操作'、'用XX插件'时调用此工具。\n"
+                "注意：tool_args 可以是自然语言（如'北京'），也可以是 JSON（如{'city': '北京'}）。"
             ),
             self._call_plugin_handler,
         )
@@ -113,13 +114,12 @@ class Main(Star):
                 {
                     "type": "string",
                     "name": "keywords",
-                    "description": "Search keywords in natural language, e.g. 'search image', 'translate', 'check weather'.",
+                    "description": "搜索关键词，例如 '搜索图片'、'翻译'、'查天气'、'播放音乐' 等自然语言描述。",
                 },
             ],
             (
-                "Search for available plugin tools by keywords. "
-                "Call this when the user describes a need but you're unsure "
-                "which plugin fits."
+                "按关键词搜索可用的插件工具。当用户描述了一个需求但你不确定哪个插件适合时，\n"
+                "用此工具搜索。例如用户说'帮我找一张猫的照片'，搜索关键词 '猫 图片'。"
             ),
             self._search_plugin_tools_handler,
         )
