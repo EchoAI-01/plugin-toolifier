@@ -1,953 +1,1121 @@
-"""插件工具化（Plugin Toolifier）。
+"""Plugin Toolifier.
 
-功能：
-1. 向 Agent 注册三个核心 LLM Tool：
-   - list_plugins: 列出所有有 LLM Tool 的插件
-   - call_plugin: 按名称调用指定插件的 LLM Tool
-   - search_plugin_tools: 按关键词搜索可用工具
-2. 同时提供 IM 命令 /list_plugins 和 /search_plugins 供用户直接调用。
-
-设计说明：
-- 只暴露有 LLM Tool（function-calling）的插件，过滤纯辅助性质的插件（如分段发送、消息装饰）。
-- 纯事件驱动缓存：插件加载/卸载、工具激活/停用、插件启停时自动刷新，无定时 TTL。
-
-缓存失效覆盖场景（6 个入口全部覆盖）：
-- 插件安装/加载 → on_plugin_loaded 事件
-- 插件卸载 → on_plugin_unloaded 事件
-- 工具单独停用/激活 → FunctionToolManager 猴子补丁
-- 插件禁用/启用 → PluginManager 猴子补丁
+Expose selected AstrBot command plugins as LLM-callable tools. The bridge keeps
+the original command filters in the call path so natural-language invocation
+does not silently bypass plugin permissions.
 """
 
 from __future__ import annotations
 
 import asyncio
+import copy
+import hashlib
 import inspect
 import json
+import re
+import shlex
+import types
+import typing
+from collections.abc import Awaitable, Callable
+from dataclasses import dataclass, field
 from typing import Any
 
 from astrbot.api import logger
-from astrbot.api.all import Star, Context
+from astrbot.api.all import Context, Star
 from astrbot.api.event import AstrMessageEvent, filter
-import time
-import uuid
+from astrbot.core import sp
+from astrbot.core.message.components import Image, Plain
+from astrbot.core.message.message_event_result import MessageChain, MessageEventResult
+from astrbot.core.platform.astrbot_message import AstrBotMessage
+from astrbot.core.provider.entities import ProviderRequest
+from astrbot.core.star.filter.command import CommandFilter, GreedyStr
+from astrbot.core.star.filter.command_group import CommandGroupFilter
+from astrbot.core.star.filter.permission import PermissionType, PermissionTypeFilter
+from astrbot.core.star.star import StarMetadata, star_registry
+from astrbot.core.star.star_handler import EventType, StarHandlerMetadata
+from astrbot.core.star.star_handler import star_handlers_registry
 
-from astrbot.core.star import star_map as _star_map, star_registry
-from astrbot.core.message.message_event_result import MessageEventResult
-from astrbot.core.message.components import Plain
+PLUGIN_MODULE_PATH = "data.plugins.astrbot_plugin_toolifier.main"
+PLUGIN_NAME = "astrbot_plugin_toolifier"
+META_TOOL_NAMES = {
+    "list_plugin_commands",
+    "search_plugin_commands",
+    "call_plugin_command",
+    "list_plugins",
+    "search_plugin_tools",
+    "call_plugin",
+}
+META_TOOL_REQUIRED = {
+    "search_plugin_commands": ["keywords"],
+    "call_plugin_command": ["plugin_name", "command_name"],
+    "search_plugin_tools": ["keywords"],
+    "call_plugin": ["plugin_name", "tool_name"],
+}
+
+
+@dataclass(frozen=True)
+class CommandParameter:
+    name: str
+    schema_type: str
+    required: bool
+    description: str
+    raw_spec: Any
+
+    def as_func_arg(self) -> dict[str, Any]:
+        schema = {
+            "type": self.schema_type,
+            "name": self.name,
+            "description": self.description,
+        }
+        if self.schema_type == "array":
+            schema["items"] = {"type": "string"}
+        return schema
+
+
+@dataclass
+class CommandEntry:
+    plugin_name: str
+    plugin_desc: str
+    plugin_author: str | None
+    plugin_version: str | None
+    module_path: str
+    handler: StarHandlerMetadata
+    command_filter: CommandFilter
+    command_name: str
+    aliases: list[str]
+    command_id: str
+    tool_name: str
+    description: str
+    parameters: list[CommandParameter] = field(default_factory=list)
+    is_admin: bool = False
+    reserved: bool = False
+
+    @property
+    def display_name(self) -> str:
+        return f"{self.plugin_name}:{self.command_name}"
 
 
 class Main(Star):
-    """Agent 插件发现插件。
-
-    自动将所有已加载插件的 LLM Tool 暴露给 Agent，
-    使 Agent 能感知、查询、调用任何插件的功能。
-    """
+    """Discover command plugins and expose them to the Agent safely."""
 
     author = "Chen"
-    name = "astrbot_plugin_toolifier"
-    desc = "插件工具化 — 自动将 AstrBot 插件注册为 LLM 工具，使 Agent 能发现、查询、调用所有插件的能力。"
+    name = PLUGIN_NAME
+    desc = "Expose selected AstrBot command plugins as LLM-callable tools."
 
-    def __init__(self, context: Context, config: dict = None) -> None:
+    def __init__(self, context: Context, config: dict | None = None) -> None:
         super().__init__(context, config)
-        # Cached catalog: None means cache is stale
-        self._catalog_cache: list[dict[str, Any]] | None = None
-        self._patched = False
-        # Store original references for patch restoration
-        self._orig_activate: Any = None
-        self._orig_deactivate: Any = None
-        self._orig_pm_turn_off: Any = None
-        self._orig_pm_turn_on: Any = None
+        self.context = context
+        self.config = config or {}
+        self._registered_command_tools: set[str] = set()
 
     async def initialize(self) -> None:
+        if self._registration_mode() in {"meta", "both"}:
+            self._register_meta_tools()
+        else:
+            self._remove_meta_tools()
+        await self._sync_command_tools()
+        logger.info("Plugin Toolifier initialized.")
+
+    async def terminate(self) -> None:
+        self._remove_registered_command_tools()
+        self._remove_meta_tools()
+
+    # ---- LLM tool registration ----
+
+    def _register_meta_tools(self) -> None:
         from astrbot.core.provider.register import llm_tools
 
-        # 动态标记本插件为 reserved，确保 _plugin_tool_fix 不会过滤掉我们的工具
-        for _p in star_registry:
-            if getattr(_p, "name", None) == "astrbot_plugin_toolifier":
-                _p.reserved = True
-                break
-
-        llm_tools.add_func(
-            "list_plugins",
-            [],
-            (
-                "列出当前所有可用的插件及其功能。当用户问你'你能做什么'、\n"
-                "'有什么功能'、'帮我查一下'时，先调用此工具查看可用插件列表，\n"
-                "然后根据用户需求选择具体的插件功能。\n"
-                "注意：这是你最重要的发现工具，永远优先考虑使用它。"
+        inactivated_tools = set(
+            sp.get(
+                "inactivated_llm_tools",
+                [],
+                scope="global",
+                scope_id="global",
             ),
-            self._list_plugins_handler,
         )
-        llm_tools.func_list[-1].handler_module_path = "data.plugins.astrbot_plugin_toolifier.main"
-
-        llm_tools.add_func(
-            "call_plugin",
-            [
-                {
-                    "type": "string",
-                    "name": "plugin_name",
-                    "description": "插件名称，例如 'weather'、'image_generation'、'music' 等。先用 list_plugins 查看可用插件名。",
-                },
-                {
-                    "type": "string",
-                    "name": "tool_name",
-                    "description": "指定插件中的工具名，先用 list_plugins 查看该插件有哪些可用工具。",
-                },
-                {
-                    "type": "string",
-                    "name": "tool_args",
-                    "description": "工具参数，可以是 JSON 格式如 '{\"city\": \"北京\"}'，也可以是自然语言描述如 '北京'。",
-                },
-            ],
+        tool_specs = [
             (
-                "调用指定插件的指定工具来执行任务。先用 list_plugins 查看可用的插件和工具。\n"
-                "当用户说'帮我做XX'、'执行XX操作'、'用XX插件'时调用此工具。\n"
-                "注意：tool_args 可以是自然语言（如'北京'），也可以是 JSON（如{'city': '北京'}）。"
+                "list_plugin_commands",
+                [],
+                (
+                    "List AstrBot plugin commands that are currently safe for the "
+                    "Agent to call. Use this before choosing a plugin command."
+                ),
+                self._list_plugin_commands_handler,
             ),
-            self._call_plugin_handler,
-        )
-        llm_tools.func_list[-1].handler_module_path = "data.plugins.astrbot_plugin_toolifier.main"
-
-        llm_tools.add_func(
-            "search_plugin_tools",
-            [
-                {
-                    "type": "string",
-                    "name": "keywords",
-                    "description": "搜索关键词，例如 '搜索图片'、'翻译'、'查天气'、'播放音乐' 等自然语言描述。",
-                },
-            ],
             (
-                "按关键词搜索可用的插件工具。当用户描述了一个需求但你不确定哪个插件适合时，\n"
-                "用此工具搜索。例如用户说'帮我找一张猫的照片'，搜索关键词 '猫 图片'。"
+                "search_plugin_commands",
+                [
+                    {
+                        "type": "string",
+                        "name": "keywords",
+                        "description": "Natural-language search keywords.",
+                    },
+                ],
+                "Search callable AstrBot plugin commands by name and description.",
+                self._search_plugin_commands_handler,
             ),
-            self._search_plugin_tools_handler,
-        )
-        llm_tools.func_list[-1].handler_module_path = "data.plugins.astrbot_plugin_toolifier.main"
+            (
+                "call_plugin_command",
+                [
+                    {
+                        "type": "string",
+                        "name": "plugin_name",
+                        "description": "Plugin name from list_plugin_commands.",
+                    },
+                    {
+                        "type": "string",
+                        "name": "command_name",
+                        "description": (
+                            "Command name, command id, alias, or generated tool name "
+                            "from list_plugin_commands."
+                        ),
+                    },
+                    {
+                        "type": "string",
+                        "name": "command_args",
+                        "description": (
+                            "Arguments as JSON object/list or plain text. Example: "
+                            "{\"city\":\"Beijing\"}."
+                        ),
+                    },
+                ],
+                "Call a safe AstrBot plugin command and return its captured output.",
+                self._call_plugin_command_handler,
+            ),
+            # Backward-compatible names for the original plugin contract.
+            (
+                "list_plugins",
+                [],
+                "Alias of list_plugin_commands.",
+                self._list_plugin_commands_handler,
+            ),
+            (
+                "search_plugin_tools",
+                [
+                    {
+                        "type": "string",
+                        "name": "keywords",
+                        "description": "Natural-language search keywords.",
+                    },
+                ],
+                "Alias of search_plugin_commands.",
+                self._search_plugin_commands_handler,
+            ),
+            (
+                "call_plugin",
+                [
+                    {
+                        "type": "string",
+                        "name": "plugin_name",
+                        "description": "Plugin name from list_plugins.",
+                    },
+                    {
+                        "type": "string",
+                        "name": "tool_name",
+                        "description": "Command/tool name from list_plugins.",
+                    },
+                    {
+                        "type": "string",
+                        "name": "tool_args",
+                        "description": "Arguments as JSON object/list or plain text.",
+                    },
+                ],
+                "Alias of call_plugin_command.",
+                self._call_plugin_alias_handler,
+            ),
+        ]
 
-        logger.info(
-            "Plugin Toolifier: registered list_plugins, call_plugin, search_plugin_tools tools"
-        )
+        for name, args, desc, handler in tool_specs:
+            llm_tools.add_func(name, args, desc, handler)
+            func_tool = llm_tools.func_list[-1]
+            func_tool.handler_module_path = PLUGIN_MODULE_PATH
+            func_tool.active = name not in inactivated_tools
+            if required_params := META_TOOL_REQUIRED.get(name):
+                func_tool.parameters["required"] = required_params
 
-        # Monkey-patch AstrBot core methods to intercept tool/plugin state changes
-        # that do NOT emit on_plugin_loaded / on_plugin_unloaded events.
-        self._monkey_patch()
-
-    # Lifecycle cleanup to restore monkey patches
-    async def terminate(self) -> None:
-        """插件卸载/停用时还原猴子补丁。"""
-        # Restore FunctionToolManager patches
-        if self._orig_activate is not None:
-            from astrbot.core.provider.register import llm_tools
-            llm_tools.activate_llm_tool = self._orig_activate
-            llm_tools.deactivate_llm_tool = self._orig_deactivate
-            logger.info("Plugin Toolifier: restored FunctionToolManager patches")
-
-        # Restore PluginManager patches
-        if self._orig_pm_turn_off is not None:
-            from astrbot.core.star.star_manager import PluginManager
-            PluginManager.turn_off_plugin = self._orig_pm_turn_off
-            PluginManager.turn_on_plugin = self._orig_pm_turn_on
-            logger.info("Plugin Toolifier: restored PluginManager patches")
-
-    # ---- Monkey-patching for complete cache invalidation coverage ----
-
-    def _monkey_patch(self) -> None:
-        """Patch FunctionToolManager and PluginManager methods for cache invalidation.
-
-        AstrBot's event system does not emit events for tool-level toggle or
-        plugin enable/disable operations. This method monkey-patches the relevant
-        methods so that every state mutation triggers cache invalidation.
-
-        Covered scenarios:
-        1. Tool toggle: activate_llm_tool / deactivate_llm_tool
-           (called from WebUI POST /api/tools/toggle)
-        2. Plugin toggle: turn_on_plugin / turn_off_plugin
-           (called from WebUI POST /api/plugin/on and /api/plugin/off)
-
-        Patches are applied once (tracked by _patched flag) to avoid duplication.
-        """
-        if self._patched:
+    @staticmethod
+    def _remove_tools_by_name(tool_names: set[str]) -> None:
+        if not tool_names:
             return
 
-        # Patch 1: FunctionToolManager.activate_llm_tool / deactivate_llm_tool
         from astrbot.core.provider.register import llm_tools
 
-        # Save original references to instance attributes for restore
-        self._orig_activate = llm_tools.activate_llm_tool
-        self._orig_deactivate = llm_tools.deactivate_llm_tool
+        llm_tools.func_list = [
+            tool
+            for tool in llm_tools.func_list
+            if not (
+                tool.name in tool_names
+                and tool.handler_module_path == PLUGIN_MODULE_PATH
+            )
+        ]
 
-        def _wrap_activate(name: str, star_map: dict) -> bool:
-            """Wrap activate_llm_tool to invalidate cache on success."""
-            result = self._orig_activate(name, star_map)
-            if result:
-                self._invalidate_cache()
-            return result
+    def _remove_meta_tools(self) -> None:
+        self._remove_tools_by_name(META_TOOL_NAMES)
 
-        def _wrap_deactivate(name: str) -> bool:
-            """Wrap deactivate_llm_tool to invalidate cache on success."""
-            result = self._orig_deactivate(name)
-            if result:
-                self._invalidate_cache()
-            return result
+    async def _sync_command_tools(self) -> None:
+        mode = self._registration_mode()
 
-        llm_tools.activate_llm_tool = _wrap_activate
-        llm_tools.deactivate_llm_tool = _wrap_deactivate
+        if mode == "meta":
+            self._remove_registered_command_tools()
+            return
 
-        # Patch 2: PluginManager.turn_on_plugin / turn_off_plugin
-        # These are async methods, so wrapped versions must also be async.
-        from astrbot.core.star.star_manager import PluginManager
+        from astrbot.core.provider.register import llm_tools
 
-        # Save original references
-        self._orig_pm_turn_off = PluginManager.turn_off_plugin
-        self._orig_pm_turn_on = PluginManager.turn_on_plugin
+        inactivated_tools = set(
+            sp.get(
+                "inactivated_llm_tools",
+                [],
+                scope="global",
+                scope_id="global",
+            ),
+        )
+        entries = self._build_command_catalog()
+        next_tools: set[str] = set()
+        for entry in entries:
+            if not self._command_allowed_by_static_policy(entry):
+                continue
 
-        async def _pm_wrap_turn_off(self_inst: PluginManager, plugin_name: str) -> None:
-            """Wrap turn_off_plugin to invalidate cache after the plugin is turned off."""
-            await self._orig_pm_turn_off(self_inst, plugin_name)
-            self._invalidate_cache()
-            logger.debug(f"Plugin {plugin_name} turned off, cleared discovery cache")
+            next_tools.add(entry.tool_name)
+            llm_tools.add_func(
+                entry.tool_name,
+                [param.as_func_arg() for param in entry.parameters],
+                (
+                    f"Call AstrBot command /{entry.command_name} from plugin "
+                    f"{entry.plugin_name}. {entry.description}"
+                ),
+                self._make_command_tool_handler(entry.command_id),
+            )
+            func_tool = llm_tools.func_list[-1]
+            func_tool.handler_module_path = PLUGIN_MODULE_PATH
+            func_tool.active = entry.tool_name not in inactivated_tools
+            if required_params := [
+                param.name for param in entry.parameters if param.required
+            ]:
+                func_tool.parameters["required"] = required_params
 
-        async def _pm_wrap_turn_on(self_inst: PluginManager, plugin_name: str) -> None:
-            """Wrap turn_on_plugin to invalidate cache after the plugin is turned on."""
-            await self._orig_pm_turn_on(self_inst, plugin_name)
-            self._invalidate_cache()
-            logger.debug(f"Plugin {plugin_name} turned on, cleared discovery cache")
+        for old_name in self._registered_command_tools - next_tools:
+            self._remove_tools_by_name({old_name})
+        self._registered_command_tools = next_tools
 
-        PluginManager.turn_off_plugin = _pm_wrap_turn_off
-        PluginManager.turn_on_plugin = _pm_wrap_turn_on
+    def _remove_registered_command_tools(self) -> None:
+        if not self._registered_command_tools:
+            return
 
-        self._patched = True
-        logger.info(
-            "Plugin Toolifier: monkey-patched cache invalidation for "
-            "tool toggle and plugin enable/disable"
+        self._remove_tools_by_name(self._registered_command_tools)
+        self._registered_command_tools.clear()
+
+    def _make_command_tool_handler(
+        self,
+        command_id: str,
+    ) -> Callable[..., Awaitable[str]]:
+        async def _handler(event: AstrMessageEvent, **kwargs: Any) -> str:
+            return await self._call_command_by_id(event, command_id, kwargs)
+
+        return _handler
+
+    # ---- Catalog ----
+
+    def _build_command_catalog(
+        self,
+        event: AstrMessageEvent | None = None,
+        disabled_plugins: set[str] | None = None,
+    ) -> list[CommandEntry]:
+        entries: list[CommandEntry] = []
+        metadata_by_prefix = self._metadata_by_prefix()
+        handlers = star_handlers_registry.get_handlers_by_event_type(
+            EventType.AdapterMessageEvent,
+            plugins_name=event.plugins_name if event else None,
         )
 
-    # ---- Cache management ----
-
-    def _invalidate_cache(self) -> None:
-        """Mark cache as stale. The next catalog read will rebuild it."""
-        self._catalog_cache = None
-
-    def _build_plugin_catalog(self) -> list[dict[str, Any]]:
-        """Build a catalog of all loaded plugins that expose active LLM tools.
-
-        Primary data source: star_handlers_registry (OnCallingFuncToolEvent handlers).
-        Each @llm_tool decorated function creates a handler with a fixed
-        handler_module_path that survives functools.partial wrapping.
-
-        Parameters are obtained from llm_tools.func_list (registered at decoration
-        time with full schema), then matched by tool name.
-
-        Uses event-driven cache: cache is rebuilt only when stale (plugin loaded,
-        unloaded, tool activated/deactivated, or plugin turned on/off).
-        """
-        if self._catalog_cache is not None:
-            return self._catalog_cache
-
-        from astrbot.core.provider.register import llm_tools
-        from astrbot.core.star.register.star_handler import EventType
-        from astrbot.core.star.star_handler import star_handlers_registry
-
-        catalog: dict[str, dict[str, Any]] = {}
-
-        # Build a mapping from module_path prefix to plugin metadata.
-        # This handles both main module (e.g. "data.plugins.xxx.main")
-        # and sub-modules (e.g. "data.plugins.xxx.tools.search") since
-        # star_map only has the main module key.
-        prefix_map: dict[str, Any] = {}
-        for metadata in star_registry:
-            mp = metadata.module_path
-            if not mp:
+        for handler in handlers:
+            if not handler.enabled:
                 continue
-            prefix_map[mp] = metadata
-
-        # 1. Collect LLM Tools from star_handlers_registry.
-        for handler_md in star_handlers_registry:
-            if handler_md.event_type != EventType.OnCallingFuncToolEvent:
+            metadata = self._find_metadata(
+                handler.handler_module_path,
+                metadata_by_prefix,
+            )
+            if not metadata or not metadata.name or not metadata.module_path:
+                continue
+            if not metadata.activated:
+                continue
+            if disabled_plugins and metadata.name in disabled_plugins:
                 continue
 
-            mp = handler_md.handler_module_path
-            if not mp:
+            command_filters = [
+                filter_
+                for filter_ in handler.event_filters
+                if isinstance(filter_, CommandFilter)
+            ]
+            if not command_filters:
                 continue
 
-            # Find the owning plugin via prefix match.
-            # The handler_module_path might be a sub-module like
-            # "data.plugins.xxx.tools.search", while star_map only has
-            # "data.plugins.xxx.main". We need to find the best matching
-            # prefix: longest matching prefix first, then fall back to
-            # checking if mp starts with any known prefix.
-            meta: Any = None
-            # First try exact match
-            if mp in prefix_map:
-                meta = prefix_map[mp]
-            else:
-                # Try prefix match: find the longest known prefix that mp starts with
-                best_match = ""
-                for known_mp, known_meta in prefix_map.items():
-                    if mp.startswith(known_mp + ".") and len(known_mp) > len(best_match):
-                        best_match = known_mp
-                        meta = known_meta
-                    elif mp == known_mp:
-                        meta = known_meta
-                        break
-
-            if not meta or not meta.name:
-                continue
-
-            # Skip if the owning plugin is inactive
-            if not meta.activated and not getattr(meta, "reserved", False):
-                continue
-
-            name_key = meta.module_path or mp
-            if name_key not in catalog:
-                catalog[name_key] = {
-                    "name": meta.name,
-                    "author": meta.author,
-                    "desc": meta.desc,
-                    "version": meta.version,
-                    "activated": meta.activated,
-                    "reserved": getattr(meta, "reserved", False),
-                    "_module_path": meta.module_path,  # for call_plugin precise matching
-                    "tools": [],
-                    "commands": [],
-                }
-
-            tool_name = handler_md.handler_name
-
-            # Check if we already added this tool (skip duplicates)
-            if any(t["name"] == tool_name for t in catalog[name_key]["tools"]):
-                continue
-
-            # Get full parameters from func_list (registered at decoration time)
-            params: dict = {}
-            for ft in llm_tools.func_list:
-                if ft.name == tool_name:
-                    params = ft.parameters or {}
-                    break
-
-            catalog[name_key]["tools"].append({
-                "name": tool_name,
-                "description": handler_md.desc or "",
-                "parameters": params,
-            })
-
-        # 2. Collect command info from handler registry
-        for handler_md in star_handlers_registry:
-            mp = handler_md.handler_module_path
-            if not mp:
-                continue
-
-            # Same prefix matching for commands
-            meta: Any = None
-            if mp in prefix_map:
-                meta = prefix_map[mp]
-            else:
-                best_match = ""
-                for known_mp, known_meta in prefix_map.items():
-                    if mp.startswith(known_mp + ".") and len(known_mp) > len(best_match):
-                        best_match = known_mp
-                        meta = known_meta
-
-            if not meta or not meta.name:
-                continue
-            name_key = meta.module_path or mp
-            if name_key not in catalog:
-                continue
-            for ef in handler_md.event_filters:
-                if hasattr(ef, "command_name"):
-                    cmd = ef.command_name
-                    if hasattr(ef, "parent_command_names"):
-                        for pn in (getattr(ef, "parent_command_names") or []):
-                            cmd = f"{pn} {cmd}"
-                    if cmd not in catalog[name_key]["commands"]:
-                        catalog[name_key]["commands"].append(cmd)
-
-        # 4. Discover @filter.command handlers and expose them as LLM tools.
-        #    This bridges the gap: most AstrBot plugins register @filter.command
-        #    (not @llm_tool), so they are invisible to the Agent. Here we wrap
-        #    each command handler into a catalog entry that Agent can call via
-        #    call_plugin with tool_name "cmd_<command_name>".
-        for handler_md in star_handlers_registry:
-            # Only process AdapterMessageEvent handlers (i.e. command/event handlers)
-            if handler_md.event_type != EventType.AdapterMessageEvent:
-                continue
-
-            mp = handler_md.handler_module_path
-            if not mp:
-                continue
-
-            # Prefix match for sub-module handlers
-            meta: Any = None
-            if mp in prefix_map:
-                meta = prefix_map[mp]
-            else:
-                best_match = ""
-                for known_mp, known_meta in prefix_map.items():
-                    if mp.startswith(known_mp + ".") and len(known_mp) > len(best_match):
-                        best_match = known_mp
-                        meta = known_meta
-
-            if not meta or not meta.name:
-                continue
-
-            # Skip if the owning plugin is inactive (unless reserved)
-            if not meta.activated and not getattr(meta, "reserved", False):
-                continue
-
-            name_key = meta.module_path or mp
-            if name_key not in catalog:
-                catalog[name_key] = {
-                    "name": meta.name,
-                    "author": meta.author,
-                    "desc": meta.desc,
-                    "version": meta.version,
-                    "activated": meta.activated,
-                    "reserved": getattr(meta, "reserved", False),
-                    "_module_path": meta.module_path,
-                    "tools": [],
-                    "commands": [],
-                }
-
-            # Find CommandFilter in event filters
-            for ef in handler_md.event_filters:
-                if not hasattr(ef, "command_name"):
-                    continue
-                cmd_name = ef.command_name
-                parent_names = getattr(ef, "parent_command_names", None) or []
-                for pn in parent_names:
-                    if pn:
-                        cmd_name = f"{pn} {cmd_name}"
-
-                # Build function args schema from handler_params
-                func_args = _build_func_args_from_command(ef)
-
-                # Tool name prefixed with "cmd_" to distinguish from @llm_tool
-                tool_name = f"cmd_{cmd_name}"
-
-                # Skip duplicate tools
-                if any(t["name"] == tool_name for t in catalog[name_key]["tools"]):
+            for command_filter in command_filters:
+                command_names = command_filter.get_complete_command_names()
+                if not command_names:
                     continue
 
-                catalog[name_key]["tools"].append({
-                    "name": tool_name,
-                    "description": handler_md.desc or f"Execute the command /{cmd_name}",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            p["name"]: p for p in func_args
-                        },
-                        "required": [p["name"] for p in func_args if p.get("required", False)],
-                    },
-                    "_handler_md": handler_md,
-                    "_cmd_filter": ef,
-                    "_is_command": True,
-                })
+                command_name = command_names[0]
+                aliases = command_names[1:]
+                parameters = self._build_parameters(command_filter)
+                command_id = self._command_id(
+                    metadata.module_path,
+                    handler,
+                    command_name,
+                )
+                entries.append(
+                    CommandEntry(
+                        plugin_name=metadata.name,
+                        plugin_desc=metadata.desc or "",
+                        plugin_author=metadata.author,
+                        plugin_version=metadata.version,
+                        module_path=metadata.module_path,
+                        handler=handler,
+                        command_filter=command_filter,
+                        command_name=command_name,
+                        aliases=aliases,
+                        command_id=command_id,
+                        tool_name=self._tool_name(
+                            metadata.name,
+                            command_name,
+                            command_id,
+                        ),
+                        description=handler.desc or f"Execute /{command_name}",
+                        parameters=parameters,
+                        is_admin=self._is_admin_command(handler),
+                        reserved=metadata.reserved,
+                    )
+                )
 
-        # 5. Filter: only include plugins that have at least one tool
-        result = []
-        for info in catalog.values():
-            if not info["activated"] and not info["reserved"]:
-                continue
-            if not info["tools"]:
-                continue
-            result.append(info)
+        return sorted(entries, key=lambda item: (item.plugin_name, item.command_name))
 
-        self._catalog_cache = result
-        return result
+    async def _build_command_catalog_for_event(
+        self,
+        event: AstrMessageEvent,
+    ) -> list[CommandEntry]:
+        return self._build_command_catalog(
+            event,
+            await self._disabled_plugins_for_event(event),
+        )
 
-# ---- Helper functions for command tool exposure ----
+    @staticmethod
+    def _metadata_by_prefix() -> dict[str, StarMetadata]:
+        return {
+            metadata.module_path: metadata
+            for metadata in star_registry
+            if metadata.module_path
+        }
 
-def _build_func_args_from_command(cmd_filter) -> list[dict]:
-    """Convert command handler parameters to JSON Schema parameter list.
-    
-    Reads from CommandFilter.handler_params which maps param_name -> 
-    type_or_default_value.
-    """
-    import types
-    import typing
-    
-    args = []
-    for param_name, type_or_default in cmd_filter.handler_params.items():
-        param_info = {"name": param_name}
-        
-        if isinstance(type_or_default, type):
-            # Type annotation (e.g. str, int)
-            type_map = {"str": "string", "int": "integer", "float": "number", "bool": "boolean"}
-            param_info["type"] = type_map.get(type_or_default.__name__, "string")
-            param_info["required"] = True
-        elif isinstance(type_or_default, types.UnionType) or typing.get_origin(type_or_default) is typing.Union:
-            # Optional[T] etc
-            param_info["type"] = "string"
-            param_info["required"] = False
-        else:
-            # Has default value
-            param_info["type"] = "string"
-            param_info["required"] = False
-        
-        param_info["description"] = f"Parameter: {param_name}"
-        args.append(param_info)
-    
-    return args
+    @staticmethod
+    def _find_metadata(
+        module_path: str,
+        metadata_by_prefix: dict[str, StarMetadata],
+    ) -> StarMetadata | None:
+        if module_path in metadata_by_prefix:
+            return metadata_by_prefix[module_path]
 
+        best_prefix = ""
+        best_metadata = None
+        for prefix, metadata in metadata_by_prefix.items():
+            if module_path.startswith(prefix + ".") and len(prefix) > len(best_prefix):
+                best_prefix = prefix
+                best_metadata = metadata
+        return best_metadata
 
-def _extract_text(result) -> str:
-    """Extract plain text from various handler result types."""
-    if isinstance(result, str):
-        return result
-    if isinstance(result, MessageEventResult):
-        parts = []
-        for comp in (result.chain or []):
-            if hasattr(comp, "text"):
-                parts.append(comp.text)
-            else:
-                parts.append(str(comp))
-        return "\n".join(parts)
-    if hasattr(result, "message"):
-        return str(result.message)
-    return str(result)
+    @staticmethod
+    def _command_id(
+        module_path: str,
+        handler: StarHandlerMetadata,
+        command_name: str,
+    ) -> str:
+        raw = f"{module_path}:{handler.handler_full_name}:{command_name}"
+        return hashlib.sha1(raw.encode("utf-8")).hexdigest()[:12]
 
+    @staticmethod
+    def _tool_name(plugin_name: str, command_name: str, command_id: str) -> str:
+        raw_name = f"{plugin_name}_{command_name}".lower()
+        safe_name = re.sub(r"[^a-z0-9_]+", "_", raw_name).strip("_")
+        if not safe_name:
+            safe_name = "command"
+        return f"plugin_cmd_{safe_name}_{command_id}"
 
-def _create_fake_event(
-    message_str: str,
-    original_event: AstrMessageEvent,
-) -> AstrMessageEvent:
-    """Create a minimal AstrMessageEvent for command invocation.
-    
-    This simulates a user sending the command text directly to the bot,
-    allowing command handlers to work without modification.
-    """
-    from astrbot.core.platform.astrbot_message import AstrBotMessage, MessageMember
-    from astrbot.core.platform.message_type import MessageType
-    from astrbot.core.platform.sources.webchat.webchat_event import WebChatMessageEvent
-    
-    msg = AstrBotMessage()
-    msg.type = MessageType.FRIEND_MESSAGE
-    msg.self_id = original_event.get_self_id()
-    msg.session_id = original_event.session_id
-    msg.message_id = f"toolifier_{uuid.uuid4().hex[:8]}"
-    msg.sender = MessageMember(
-        user_id=original_event.get_sender_id() or "toolifier_agent",
-        nickname="Agent",
-    )
-    msg.message = [Plain(message_str)]
-    msg.message_str = message_str
-    msg.timestamp = int(time.time())
-    
-    fake_event = WebChatMessageEvent(
-        message_str, msg, original_event.platform_meta, original_event.session_id
-    )
-    fake_event.is_wake = True
-    fake_event.is_at_or_wake_command = True
-    return fake_event
+    @staticmethod
+    def _is_admin_command(handler: StarHandlerMetadata) -> bool:
+        for filter_ in handler.event_filters:
+            if (
+                isinstance(filter_, PermissionTypeFilter)
+                and filter_.permission_type == PermissionType.ADMIN
+            ):
+                return True
+        return False
 
+    def _build_parameters(
+        self,
+        command_filter: CommandFilter,
+    ) -> list[CommandParameter]:
+        parameters = []
+        for name, raw_spec in command_filter.handler_params.items():
+            schema_type, required = self._schema_type_and_required(raw_spec)
+            parameters.append(
+                CommandParameter(
+                    name=name,
+                    schema_type=schema_type,
+                    required=required,
+                    description=(
+                        f"Parameter `{name}` for /{command_filter.command_name}."
+                    ),
+                    raw_spec=raw_spec,
+                )
+            )
+        return parameters
 
-    # ---- Handlers for the three meta tools ----
+    @staticmethod
+    def _schema_type_and_required(raw_spec: Any) -> tuple[str, bool]:
+        if raw_spec is GreedyStr:
+            return "string", False
+        if isinstance(raw_spec, type):
+            return _python_type_to_schema_type(raw_spec), True
+        if (
+            isinstance(raw_spec, types.UnionType)
+            or typing.get_origin(raw_spec) is typing.Union
+        ):
+            non_none = [
+                item for item in typing.get_args(raw_spec) if item is not type(None)
+            ]
+            if len(non_none) == 1 and isinstance(non_none[0], type):
+                return _python_type_to_schema_type(non_none[0]), True
+            return "string", True
+        return _python_value_to_schema_type(raw_spec), False
 
-    async def _list_plugins_handler(self, event: AstrMessageEvent) -> str:
-        """Return a formatted string listing all plugins with active LLM tools.
+    # ---- Safety policy ----
 
-        The event parameter is required by AstrBot's tool execution system.
-        Used both by the Agent tool and the IM command handler.
-        """
-        catalog = self._build_plugin_catalog()
+    def _command_allowed_by_static_policy(self, entry: CommandEntry) -> bool:
+        if entry.plugin_name == PLUGIN_NAME:
+            return False
+        if entry.reserved and not self._setting("expose_builtin_commands", False):
+            return False
+        if entry.is_admin and not self._setting("allow_admin_commands", False):
+            return False
 
-        if not catalog:
-            return "当前没有加载任何提供 LLM Tool 的插件。"
+        allow_plugins = self._setting_set("allow_plugins")
+        deny_plugins = self._setting_set("deny_plugins")
+        allow_commands = self._setting_set("allow_commands")
+        deny_commands = self._setting_set("deny_commands")
 
-        lines = [f"\U0001f4e6 已加载 {len(catalog)} 个插件（提供 LLM 工具）：\n"]
+        if entry.plugin_name in deny_plugins:
+            return False
+        if allow_plugins and entry.plugin_name not in allow_plugins:
+            return False
 
-        for info in catalog:
-            status = "✅" if info["activated"] else "⏸️"
-            reserved_tag = " (内置)" if info["reserved"] else ""
-            lines.append(f"  {status} **{info['name']}**{reserved_tag}")
-            if info["author"]:
-                lines.append(f"     作者: {info['author']}")
-            if info["version"]:
-                lines.append(f"     版本: {info['version']}")
-            if info["desc"]:
-                lines.append(f"     描述: {info['desc']}")
+        command_keys = self._command_policy_keys(entry)
+        if deny_commands and command_keys & deny_commands:
+            return False
+        if allow_commands and not (command_keys & allow_commands):
+            return False
+        return True
 
-            lines.append(f"     LLM 工具 ({len(info['tools'])}):")
-            for tool in info["tools"]:
-                lines.append(f"       - `{tool['name']}`: {tool['description']}")
-            lines.append("")
+    def _command_policy_keys(self, entry: CommandEntry) -> set[str]:
+        return {
+            entry.command_name,
+            entry.command_id,
+            entry.tool_name,
+            f"{entry.plugin_name}:{entry.command_name}",
+            f"{entry.plugin_name}.{entry.command_name}",
+        }
 
-            if info["commands"]:
-                lines.append(f"     命令 ({len(info['commands'])}):")
-                for cmd in info["commands"][:10]:
-                    lines.append(f"       - {cmd}")
-                if len(info["commands"]) > 10:
-                    lines.append(f"       ... 还有 {len(info['commands']) - 10} 个")
+    async def _validate_runtime_filters(
+        self,
+        event: AstrMessageEvent,
+        entry: CommandEntry,
+        command_args: dict[str, Any],
+    ) -> tuple[bool, str, AstrMessageEvent, dict[str, Any]]:
+        fake_event = self._create_command_event(event, entry, command_args)
+        config = self.context.get_config(fake_event.unified_msg_origin)
+        parsed_params: dict[str, Any] = {}
+
+        for handler_filter in entry.handler.event_filters:
+            try:
+                if isinstance(handler_filter, CommandFilter):
+                    if not handler_filter.filter(fake_event, config):
+                        return False, "命令过滤器未通过。", fake_event, {}
+                    parsed_params = dict(
+                        fake_event.get_extra("parsed_params", {}) or {},
+                    )
+                    continue
+                if isinstance(handler_filter, CommandGroupFilter):
+                    if not handler_filter.filter(fake_event, config):
+                        return (
+                            False,
+                            f"命令 /{entry.command_name} 的指令组条件未满足。",
+                            fake_event,
+                            {},
+                        )
+                    continue
+                if isinstance(handler_filter, PermissionTypeFilter):
+                    if not handler_filter.filter(fake_event, config):
+                        return (
+                            False,
+                            f"当前用户无权调用 /{entry.command_name}。",
+                            fake_event,
+                            {},
+                        )
+                    continue
+                if not handler_filter.filter(fake_event, config):
+                    return (
+                        False,
+                        f"命令 /{entry.command_name} 的运行条件未满足。",
+                        fake_event,
+                        {},
+                    )
+            except Exception as exc:
+                return False, f"命令过滤器校验失败: {exc}", fake_event, {}
+
+        fake_event._extras.pop("parsed_params", None)
+        return True, "", fake_event, parsed_params
+
+    # ---- Meta tool handlers ----
+
+    async def _list_plugin_commands_handler(self, event: AstrMessageEvent) -> str:
+        entries = [
+            entry
+            for entry in await self._build_command_catalog_for_event(event)
+            if self._command_allowed_by_static_policy(entry)
+        ]
+        if not entries:
+            return "当前没有可供 LLM 安全调用的插件命令。"
+
+        lines = [f"已发现 {len(entries)} 个可调用插件命令："]
+        current_plugin = None
+        for entry in entries:
+            if entry.plugin_name != current_plugin:
+                current_plugin = entry.plugin_name
                 lines.append("")
-
+                lines.append(f"- 插件 `{entry.plugin_name}`: {entry.plugin_desc}")
+            lines.append(
+                f"  - /{entry.command_name} "
+                f"(command_id={entry.command_id}, tool={entry.tool_name})"
+            )
+            if entry.description:
+                lines.append(f"    描述: {entry.description}")
+            if entry.aliases:
+                lines.append(f"    别名: {', '.join(entry.aliases)}")
+            if entry.parameters:
+                params = ", ".join(
+                    f"{param.name}:{param.schema_type}"
+                    + ("*" if param.required else "")
+                    for param in entry.parameters
+                )
+                lines.append(f"    参数: {params}")
         return "\n".join(lines)
 
-    async def _call_plugin_handler(
+    async def _search_plugin_commands_handler(
+        self,
+        event: AstrMessageEvent,
+        keywords: str,
+    ) -> str:
+        keywords = keywords.strip().lower()
+        if not keywords:
+            return "请提供搜索关键词。"
+
+        entries = [
+            entry
+            for entry in await self._build_command_catalog_for_event(event)
+            if self._command_allowed_by_static_policy(entry)
+        ]
+        terms = [term for term in re.split(r"\s+", keywords) if term]
+        matched = [
+            entry
+            for entry in entries
+            if self._entry_matches(entry, terms)
+        ]
+
+        if not matched:
+            return f"未找到匹配 `{keywords}` 的可调用插件命令。"
+
+        lines = [f"找到 {len(matched)} 个匹配命令："]
+        for entry in matched:
+            lines.append(
+                f"- `{entry.plugin_name}` / `/{entry.command_name}` "
+                f"(command_id={entry.command_id}, tool={entry.tool_name})"
+            )
+            lines.append(f"  {entry.description}")
+        return "\n".join(lines)
+
+    async def _call_plugin_command_handler(
+        self,
+        event: AstrMessageEvent,
+        plugin_name: str,
+        command_name: str,
+        command_args: str = "",
+    ) -> str:
+        entry = await self._find_command_entry(event, plugin_name, command_name)
+        if not entry:
+            return (
+                f"未找到插件 `{plugin_name}` 中的命令 `{command_name}`。"
+                "请先调用 list_plugin_commands 或 search_plugin_commands。"
+            )
+        args = self._parse_command_args(entry, command_args)
+        if isinstance(args, str):
+            return args
+        return await self._call_entry(event, entry, args)
+
+    async def _call_plugin_alias_handler(
         self,
         event: AstrMessageEvent,
         plugin_name: str,
         tool_name: str,
         tool_args: str = "",
     ) -> str:
-        from astrbot.core.provider.register import llm_tools
-        from astrbot.core.star.register.star_handler import EventType
-        from astrbot.core.star.star_handler import star_handlers_registry
+        return await self._call_plugin_command_handler(
+            event,
+            plugin_name,
+            tool_name,
+            tool_args,
+        )
 
-        catalog = self._build_plugin_catalog()
-
-        # 精确匹配 > 大小写不敏感匹配 > 子串匹配（降级）
-        plugin_info = None
-        for info in catalog:
-            if info["name"] == plugin_name:
-                plugin_info = info
-                break
-
-        if not plugin_info:
-            for info in catalog:
-                if (info.get("name") or "").lower() == plugin_name.lower():
-                    plugin_info = info
-                    break
-
-        if not plugin_info:
-            matches = [
-                info for info in catalog
-                if plugin_name.lower() in (info.get("name") or "").lower()
-            ]
-            if matches:
-                plugin_info = matches[0]
-                plugin_name = plugin_info["name"]
-            else:
-                return f"未找到插件 '{plugin_name}'。请使用 `list_plugins` 查看提供 LLM 工具的插件。"
-
-        # 工具名匹配：精确匹配 > 大小写不敏感匹配 > 子串匹配
-        tool_info = None
-        for t in plugin_info["tools"]:
-            if t["name"] == tool_name:
-                tool_info = t
-                break
-
-        if not tool_info:
-            for t in plugin_info["tools"]:
-                if t["name"].lower() == tool_name.lower():
-                    tool_info = t
-                    break
-
-        if not tool_info:
-            matches = [
-                t for t in plugin_info["tools"]
-                if tool_name.lower() in t["name"].lower()
-            ]
-            if matches:
-                tool_info = matches[0]
-                tool_name = tool_info["name"]
-            else:
-                tool_names = [t["name"] for t in plugin_info["tools"]]
-                return f"插件 '{plugin_info['name']}' 中未找到工具 '{tool_name}'。\n可用工具: {', '.join(tool_names)}"
-
-        # Resolve the actual FunctionTool by matching both name AND module_path.
-        # Use star_handlers_registry for precise matching (handler_module_path
-        # is fixed at decoration time and not affected by functools.partial).
-        # Supports prefix match for sub-module handlers.
-        target_module_path: str | None = None
-        for info in catalog:
-            if info["name"] == plugin_info["name"]:
-                target_module_path = info.get("_module_path")
-                break
-
-        target_ft = None
-        if target_module_path:
-            for handler_md in star_handlers_registry:
-                if handler_md.event_type != EventType.OnCallingFuncToolEvent:
-                    continue
-                if handler_md.handler_name != tool_name:
-                    continue
-                mp = handler_md.handler_module_path
-                if not mp:
-                    continue
-                if mp == target_module_path or mp.startswith(target_module_path + "."):
-                    for ft in llm_tools.func_list:
-                        if ft.name == tool_name and getattr(ft, "active", True):
-                            target_ft = ft
-                            break
-                    break
-
-        parsed_args = self._parse_args(tool_info["parameters"], tool_args)
-        if isinstance(parsed_args, str):
-            return parsed_args
-
-        if target_ft is None:
-            # Check if this is a command tool (cmd_ prefix)
-            if tool_name.startswith("cmd_") and "_is_command" in tool_info:
-                handler_md = tool_info.get("_handler_md")
-                cmd_filter = tool_info.get("_cmd_filter")
-                if handler_md and cmd_filter:
-                    return await self._invoke_command_handler(
-                        event, handler_md, cmd_filter, parsed_args,
-                    )
-            return f"工具 '{tool_name}' 所属的插件工具未注册。"
-
-        try:
-            return await self._invoke_func_tool(event, target_ft, parsed_args)
-        except Exception as e:
-            logger.exception("调用插件工具失败: %s", tool_name)
-            return f"调用插件工具 '{tool_name}' 失败: {e!s}"
-
-    async def _invoke_func_tool(
+    async def _call_command_by_id(
         self,
         event: AstrMessageEvent,
-        func_tool: Any,
-        kwargs: dict,
+        command_id: str,
+        kwargs: dict[str, Any],
     ) -> str:
-        """Invoke a FunctionTool handler, supporting both coroutine and async generator.
+        entry = await self._find_command_entry(event, "", command_id)
+        if not entry:
+            return f"命令工具 `{command_id}` 已不可用，请重新查询插件命令列表。"
+        return await self._call_entry(event, entry, kwargs)
 
-        Returns the result as a string suitable for LLM tool output.
-        """
-        handler = func_tool.handler
-        if handler is None:
-            return f"工具 '{func_tool.name}' 没有实现 handler。"
+    async def _call_entry(
+        self,
+        event: AstrMessageEvent,
+        entry: CommandEntry,
+        command_args: dict[str, Any],
+    ) -> str:
+        if not self._command_allowed_by_static_policy(entry):
+            return f"命令 /{entry.command_name} 未被当前 Toolifier 策略允许调用。"
 
-        # Check if handler is an async generator function
-        if inspect.isasyncgenfunction(handler):
-            # Async generator: iterate through yields
-            results = []
-            gen = handler(event, **kwargs)
+        ok, reason, fake_event, parsed_args = await self._validate_runtime_filters(
+            event,
+            entry,
+            command_args,
+        )
+        if not ok:
+            return reason
+
+        captured: list[MessageChain | MessageEventResult | str] = []
+        self._patch_event_senders(fake_event, captured)
+
+        try:
+            await self._invoke_handler(fake_event, entry, parsed_args, captured)
+        except Exception as exc:
+            logger.exception(
+                "Plugin Toolifier command call failed: %s",
+                entry.display_name,
+            )
+            return f"调用命令 /{entry.command_name} 失败: {exc}"
+
+        if result := fake_event.get_result():
+            captured.append(result)
+
+        text = self._captured_to_text(captured)
+        if text:
+            return text
+        return f"命令 /{entry.command_name} 执行完成，但没有产生可返回内容。"
+
+    async def _invoke_handler(
+        self,
+        fake_event: AstrMessageEvent,
+        entry: CommandEntry,
+        kwargs: dict[str, Any],
+        captured: list[MessageChain | MessageEventResult | str],
+    ) -> None:
+        timeout = self._timeout_seconds()
+        ready = entry.handler.handler(fake_event, **kwargs)
+
+        if inspect.isasyncgen(ready):
             try:
                 while True:
                     try:
                         chunk = await asyncio.wait_for(
-                            gen.__anext__(),
-                            timeout=30.0,
+                            ready.__anext__(),
+                            timeout=timeout,
                         )
-                        if chunk is not None:
-                            if hasattr(chunk, "message"):
-                                results.append(str(chunk.message))
-                            else:
-                                results.append(str(chunk))
                     except StopAsyncIteration:
                         break
-            except asyncio.TimeoutError:
-                return f"工具 '{func_tool.name}' 执行超时。"
+                    self._capture_handler_result(chunk, captured)
             finally:
-                # Guard aclose() against None or missing attribute
-                if gen is not None and hasattr(gen, "aclose"):
-                    gen.aclose()
-            if not results:
-                return f"工具 '{func_tool.name}' 执行完成。"
-            return "\n".join(results)
+                await ready.aclose()
+            return
 
-        # Exception handling is done by the caller (_call_plugin_handler)
-        result = await handler(event, **kwargs)
-        if result is None:
-            return f"工具 '{func_tool.name}' 执行完成。"
-        if hasattr(result, "message"):
-            return str(result.message)
-        return str(result)
+        if inspect.isawaitable(ready):
+            result = await asyncio.wait_for(ready, timeout=timeout)
+            self._capture_handler_result(result, captured)
+            return
 
-    async def _invoke_command_handler(
-        self,
-        event: AstrMessageEvent,
-        handler_md: Any,
-        cmd_filter: Any,
-        parsed_args: dict,
-    ) -> str:
-        """Invoke a command handler by simulating a message event.
-        
-        Builds a fake message like "/command_name arg1 arg2", creates a
-        minimal WebChatMessageEvent, and calls the handler directly.
-        """
-        # Build fake message string: /cmd arg1 arg2 ...
-        cmd_parts = [cmd_filter.command_name]
-        for k, v in parsed_args.items():
-            if isinstance(v, list):
-                cmd_parts.append(" ".join(str(x) for x in v))
-            elif isinstance(v, dict):
-                cmd_parts.append(json.dumps(v))
-            else:
-                cmd_parts.append(str(v))
-        fake_message = " ".join(cmd_parts)
-        
-        # Create simulated event
-        fake_event = _create_fake_event(fake_message, event)
-        
-        # Call the handler
-        handler = handler_md.handler
-        try:
-            if inspect.isasyncgenfunction(handler):
-                # Async generator (yields MessageEventResult)
-                results = []
-                gen = handler(fake_event, **parsed_args)
-                try:
-                    while True:
-                        try:
-                            chunk = await asyncio.wait_for(
-                                gen.__anext__(), timeout=30.0,
-                            )
-                            results.append(_extract_text(chunk))
-                        except asyncio.TimeoutError:
-                            return f"命令 '{cmd_filter.command_name}' 执行超时。"
-                        except StopAsyncIteration:
-                            break
-                finally:
-                    if hasattr(gen, "aclose"):
-                        gen.aclose()
-                return "\n".join(results) if results else "命令执行完成。"
-            else:
-                # Regular async function
-                result = await handler(fake_event, **parsed_args)
-                if result is None:
-                    return "命令执行完成。"
-                return _extract_text(result)
-        except Exception as e:
-            logger.exception("命令执行失败: %s", cmd_filter.command_name)
-            return f"命令 '{cmd_filter.command_name}' 执行失败: {e!s}"
-
-
-    def _parse_args(self, parameters: dict, tool_args: str) -> dict | str:
-        """Parse tool arguments.
-
-        Supports:
-        - JSON dict format: '{"key": "value"}'
-        - JSON list format: '["val1", "val2"]'
-        - Simple string (assigned to the first parameter, with type coercion)
-        - Empty string (returns empty dict)
-        """
-        if not tool_args or not tool_args.strip():
-            return {}
-
-        # Normalize parameters: handle both OpenAI style ({properties, required})
-        # and AstrBot decorator style ({type, name, description})
-        props = parameters.get("properties", {})
-        if not props:
-            # Some tools may use a different schema format (e.g. list of dicts)
-            # Check if parameters is already a list of parameter definitions
-            if isinstance(parameters, list):
-                if parameters:
-                    first_param = parameters[0]
-                    first_key = first_param.get("name", "arg")
-                    return {first_key: tool_args.strip()}
-                return {}
-            return {}
-
-        # Try parsing as JSON dict
-        try:
-            parsed = json.loads(tool_args)
-            if isinstance(parsed, dict):
-                return self._validate_params(parsed, parameters)
-        except (json.JSONDecodeError, ValueError):
-            pass
-
-        # Try parsing as JSON list -> map to first parameter as list
-        try:
-            parsed = json.loads(tool_args)
-            if isinstance(parsed, list):
-                if props:
-                    first_key = next(iter(props), None)
-                    if first_key:
-                        return {first_key: parsed}
-        except (json.JSONDecodeError, ValueError):
-            pass
-
-        stripped = tool_args.strip()
-        # Check for invalid JSON objects/arrays and give helpful errors
-        if stripped.startswith("{") and stripped.endswith("}"):
-            return f"参数解析失败，请检查 JSON 格式: {tool_args}"
-        if stripped.startswith("[") and stripped.endswith("]"):
-            return f"参数解析失败，请检查 JSON 格式: {tool_args}"
-
-        # Simple string -> assign to first parameter with type coercion
-        first_key = next(iter(props), None)
-        if first_key:
-            prop_schema = props.get(first_key, {})
-            prop_type = prop_schema.get("type", "")
-            value = tool_args
-            # Type coercion for string fallback
-            if prop_type == "int":
-                try:
-                    value = int(tool_args)
-                except ValueError:
-                    pass
-            elif prop_type == "float":
-                try:
-                    value = float(tool_args)
-                except ValueError:
-                    pass
-            elif prop_type == "bool":
-                value = tool_args.lower() in ("true", "yes", "1")
-            return {first_key: value}
-
-        return {}
+        self._capture_handler_result(ready, captured)
 
     @staticmethod
-    def _validate_params(parsed: dict, parameters: dict) -> dict:
-        """Validate and filter parsed parameters against the tool's parameter schema.
+    def _capture_handler_result(
+        result: Any,
+        captured: list[MessageChain | MessageEventResult | str],
+    ) -> None:
+        if result is None:
+            return
+        if isinstance(result, ProviderRequest):
+            captured.append("命令返回了 LLM 请求，Toolifier 不会执行嵌套 LLM 请求。")
+            return
+        if isinstance(result, MessageChain | MessageEventResult | str):
+            captured.append(result)
+            return
+        captured.append(str(result))
 
-        Only passes keys that exist in the tool's 'properties' definition,
-        preventing TypeError from unexpected keyword arguments.
-        """
-        allowed_keys = set(parameters.get("properties", {}).keys())
-        if not allowed_keys:
-            return parsed
-        # Keep only parameters that are defined in the tool schema
-        filtered = {k: v for k, v in parsed.items() if k in allowed_keys}
-        return filtered
-
-    async def _search_plugin_tools_handler(
+    async def _find_command_entry(
         self,
         event: AstrMessageEvent,
-        keywords: str,
+        plugin_name: str,
+        command_name: str,
+    ) -> CommandEntry | None:
+        normalized_plugin = plugin_name.strip().lower()
+        normalized_command = command_name.strip().lower()
+        for entry in await self._build_command_catalog_for_event(event):
+            if normalized_plugin and entry.plugin_name.lower() != normalized_plugin:
+                continue
+            names = {
+                entry.command_name.lower(),
+                entry.command_id.lower(),
+                entry.tool_name.lower(),
+                *(alias.lower() for alias in entry.aliases),
+            }
+            if normalized_command in names:
+                return entry
+        return None
+
+    @staticmethod
+    def _entry_matches(entry: CommandEntry, terms: list[str]) -> bool:
+        haystack = " ".join(
+            [
+                entry.plugin_name,
+                entry.plugin_desc,
+                entry.command_name,
+                entry.description,
+                " ".join(entry.aliases),
+                " ".join(param.name for param in entry.parameters),
+            ]
+        ).lower()
+        return all(term in haystack for term in terms)
+
+    # ---- Argument handling ----
+
+    def _parse_command_args(
+        self,
+        entry: CommandEntry,
+        raw_args: str,
+    ) -> dict[str, Any] | str:
+        raw_args = (raw_args or "").strip()
+        if not entry.parameters:
+            return {}
+        if not raw_args:
+            missing = [param.name for param in entry.parameters if param.required]
+            if missing:
+                return f"缺少必要参数: {', '.join(missing)}"
+            return {}
+
+        try:
+            parsed = json.loads(raw_args)
+        except json.JSONDecodeError:
+            parsed = None
+
+        if isinstance(parsed, dict):
+            return self._coerce_mapping(entry, parsed)
+        if isinstance(parsed, list):
+            return self._coerce_sequence(entry, parsed)
+        if parsed is not None:
+            return self._coerce_sequence(entry, [parsed])
+
+        try:
+            parts = shlex.split(raw_args)
+        except ValueError:
+            parts = raw_args.split()
+        return self._coerce_sequence(entry, parts)
+
+    def _coerce_mapping(
+        self,
+        entry: CommandEntry,
+        values: dict[str, Any],
+    ) -> dict[str, Any] | str:
+        result = {}
+        for param in entry.parameters:
+            if param.name not in values:
+                if param.required:
+                    return f"缺少必要参数: {param.name}"
+                continue
+            coerced = self._coerce_value(values[param.name], param)
+            if isinstance(coerced, str) and coerced.startswith("__error__:"):
+                return coerced.removeprefix("__error__:")
+            result[param.name] = coerced
+        return result
+
+    def _coerce_sequence(
+        self,
+        entry: CommandEntry,
+        values: list[Any],
+    ) -> dict[str, Any] | str:
+        result = {}
+        params = entry.parameters
+        for index, param in enumerate(params):
+            if param.raw_spec is GreedyStr:
+                value = " ".join(str(item) for item in values[index:])
+            elif index < len(values):
+                value = values[index]
+            elif param.required:
+                return f"缺少必要参数: {param.name}"
+            else:
+                continue
+
+            coerced = self._coerce_value(value, param)
+            if isinstance(coerced, str) and coerced.startswith("__error__:"):
+                return coerced.removeprefix("__error__:")
+            result[param.name] = coerced
+        return result
+
+    @staticmethod
+    def _coerce_value(value: Any, param: CommandParameter) -> Any:
+        target_type = _target_python_type(param.raw_spec)
+        if target_type is None or isinstance(value, target_type):
+            return value
+        try:
+            if target_type is bool:
+                if isinstance(value, str):
+                    lowered = value.strip().lower()
+                    if lowered in {"true", "yes", "1", "on"}:
+                        return True
+                    if lowered in {"false", "no", "0", "off"}:
+                        return False
+                    return f"__error__:参数 `{param.name}` 类型错误，应为 bool。"
+                return bool(value)
+            return target_type(value)
+        except (TypeError, ValueError):
+            return f"__error__:参数 `{param.name}` 类型错误，应为 {target_type.__name__}。"
+
+    # ---- Event capture ----
+
+    def _create_command_event(
+        self,
+        original_event: AstrMessageEvent,
+        entry: CommandEntry,
+        command_args: dict[str, Any],
+    ) -> AstrMessageEvent:
+        fake_event = copy.copy(original_event)
+        fake_event.message_obj = copy.copy(original_event.message_obj)
+        message_str = self._command_message_text(entry, command_args)
+        fake_event.message_str = message_str
+        fake_event.message_obj.message_str = message_str
+        fake_event.message_obj.message = [Plain(message_str)]
+        fake_event._result = None
+        fake_event._extras = dict(original_event.get_extra(default={}) or {})
+        fake_event._force_stopped = False
+        fake_event._has_send_oper = False
+        fake_event.call_llm = True
+        fake_event.is_wake = True
+        fake_event.is_at_or_wake_command = True
+
+        # Keep the original platform/session/sender semantics, but avoid mutating
+        # the source event's message object.
+        if isinstance(fake_event.message_obj, AstrBotMessage):
+            fake_event.message_obj.session_id = original_event.session_id
+        return fake_event
+
+    @staticmethod
+    def _command_message_text(entry: CommandEntry, command_args: dict[str, Any]) -> str:
+        parts = [entry.command_name]
+        for param in entry.parameters:
+            if param.name not in command_args:
+                continue
+            value = command_args[param.name]
+            if isinstance(value, list):
+                parts.extend(str(item) for item in value)
+            elif isinstance(value, dict):
+                parts.append(json.dumps(value, ensure_ascii=False))
+            else:
+                parts.append(str(value))
+        return " ".join(parts)
+
+    @staticmethod
+    def _patch_event_senders(
+        fake_event: AstrMessageEvent,
+        captured: list[MessageChain | MessageEventResult | str],
+    ) -> None:
+        async def _capture_send(message: MessageChain | None) -> None:
+            if message is not None:
+                captured.append(message)
+            fake_event._has_send_oper = True
+
+        async def _capture_streaming(generator, use_fallback: bool = False) -> None:
+            async for chain in generator:
+                if chain is not None:
+                    captured.append(chain)
+            fake_event._has_send_oper = True
+
+        async def _noop() -> None:
+            return None
+
+        fake_event.send = _capture_send  # type: ignore[method-assign]
+        fake_event.send_streaming = _capture_streaming  # type: ignore[method-assign]
+        fake_event.send_typing = _noop  # type: ignore[method-assign]
+        fake_event.stop_typing = _noop  # type: ignore[method-assign]
+
+    def _captured_to_text(
+        self,
+        captured: list[MessageChain | MessageEventResult | str],
     ) -> str:
-        catalog = self._build_plugin_catalog()
+        parts = []
+        for item in captured:
+            if isinstance(item, str):
+                if item.strip():
+                    parts.append(item.strip())
+                continue
+            text = self._message_chain_to_text(item)
+            if text:
+                parts.append(text)
+        return "\n".join(parts).strip()
 
-        keywords_normalized = keywords.lower()
-        results = []
-        for info in catalog:
-            for tool in info["tools"]:
-                if (keywords_normalized in tool["name"].lower() or
-                    keywords_normalized in tool["description"].lower()):
-                    results.append((info, tool))
+    @staticmethod
+    def _message_chain_to_text(message: MessageChain | MessageEventResult) -> str:
+        parts = []
+        for component in message.chain or []:
+            if isinstance(component, Plain):
+                parts.append(component.text)
+            elif isinstance(component, Image):
+                parts.append("[Image]")
+            else:
+                comp_type = getattr(component, "type", component.__class__.__name__)
+                parts.append(f"[{comp_type}]")
+        return "\n".join(part for part in parts if str(part).strip())
 
-        if not results:
-            return f"未找到匹配关键词 '{keywords}' 的工具。\n\n请使用 `list_plugins` 查看所有提供 LLM 工具的插件。"
-
-        lines = [f"\U0001f50d 找到 {len(results)} 个匹配的工具：\n"]
-        for info, tool in results:
-            lines.append(f"  **{info['name']}** / `{tool['name']}`")
-            lines.append(f"    {tool['description']}")
-            lines.append("")
-
-        return "\n".join(lines)
-
-    # ---- IM command handlers ----
+    # ---- Commands for humans ----
 
     @filter.command("list_plugins")
     async def cmd_list_plugins(self, event: AstrMessageEvent):
-        """列出所有提供 LLM 工具的插件"""
-        output = await self._list_plugins_handler(event)
+        """List plugin commands exposed to LLM."""
+        output = await self._list_plugin_commands_handler(event)
         yield event.plain_result(output).use_t2i(False)
 
     @filter.command("search_plugins")
     async def cmd_search_plugins(
-        self, event: AstrMessageEvent, keywords: str = ""
+        self,
+        event: AstrMessageEvent,
+        keywords: str = "",
     ):
-        """搜索提供 LLM 工具的插件工具"""
+        """Search plugin commands exposed to LLM."""
         if not keywords.strip():
-            yield event.plain_result("请提供搜索关键词，例如：/search_plugins 翻译").use_t2i(False)
+            yield event.plain_result(
+                "请提供搜索关键词，例如：/search_plugins 翻译",
+            ).use_t2i(False)
             return
-
-        output = await self._search_plugin_tools_handler(event, keywords)
+        output = await self._search_plugin_commands_handler(event, keywords)
         yield event.plain_result(output).use_t2i(False)
 
-    # ---- Cache invalidation hooks ----
+    # ---- Cache/sync hooks ----
 
     @filter.on_plugin_loaded()
     async def _on_plugin_loaded(self, metadata) -> None:
-        """插件加载后自动清除缓存"""
-        self._invalidate_cache()
-        logger.debug(f"Plugin {metadata.name} loaded, cleared discovery cache")
+        await self._sync_command_tools()
+        logger.debug("Plugin %s loaded, synced Toolifier command tools", metadata.name)
 
     @filter.on_plugin_unloaded()
     async def _on_plugin_unloaded(self, metadata) -> None:
-        """插件卸载后自动清除缓存"""
-        self._invalidate_cache()
-        logger.debug(f"Plugin {metadata.name} unloaded, cleared discovery cache")
+        await self._sync_command_tools()
+        logger.debug(
+            "Plugin %s unloaded, synced Toolifier command tools",
+            metadata.name,
+        )
+
+    # ---- Config helpers ----
+
+    def _setting(self, key: str, default: Any) -> Any:
+        getter = getattr(self.config, "get", None)
+        if callable(getter):
+            return getter(key, default)
+        return default
+
+    def _registration_mode(self) -> str:
+        mode = self._setting("registration_mode", "meta")
+        if mode in {"meta", "per_command", "both"}:
+            return mode
+        return "meta"
+
+    def _setting_set(self, key: str) -> set[str]:
+        value = self._setting(key, [])
+        if isinstance(value, str):
+            value = [value]
+        if not isinstance(value, list):
+            return set()
+        return {str(item).strip() for item in value if str(item).strip()}
+
+    async def _disabled_plugins_for_event(
+        self,
+        event: AstrMessageEvent,
+    ) -> set[str]:
+        session_plugin_config = await sp.get_async(
+            scope="umo",
+            scope_id=event.unified_msg_origin,
+            key="session_plugin_config",
+            default={},
+        )
+        session_config = session_plugin_config.get(event.unified_msg_origin, {})
+        disabled_plugins = session_config.get("disabled_plugins", [])
+        return {str(plugin_name) for plugin_name in disabled_plugins}
+
+    def _timeout_seconds(self) -> float:
+        raw = self._setting("tool_timeout_seconds", 30)
+        try:
+            return max(1.0, min(float(raw), 300.0))
+        except (TypeError, ValueError):
+            return 30.0
+
+
+def _python_type_to_schema_type(py_type: type) -> str:
+    if py_type is inspect.Parameter.empty:
+        return "string"
+    if py_type is bool:
+        return "boolean"
+    if py_type in {int, float}:
+        return "number"
+    if py_type in {list, tuple, set}:
+        return "array"
+    if py_type is dict:
+        return "object"
+    return "string"
+
+
+def _python_value_to_schema_type(value: Any) -> str:
+    if isinstance(value, bool):
+        return "boolean"
+    if isinstance(value, int | float):
+        return "number"
+    if isinstance(value, list | tuple | set):
+        return "array"
+    if isinstance(value, dict):
+        return "object"
+    return "string"
+
+
+def _target_python_type(raw_spec: Any) -> type | None:
+    if raw_spec is GreedyStr:
+        return str
+    if raw_spec is inspect.Parameter.empty:
+        return str
+    if isinstance(raw_spec, type):
+        return raw_spec
+    if (
+        isinstance(raw_spec, types.UnionType)
+        or typing.get_origin(raw_spec) is typing.Union
+    ):
+        non_none = [
+            item for item in typing.get_args(raw_spec) if item is not type(None)
+        ]
+        if len(non_none) == 1 and isinstance(non_none[0], type):
+            return non_none[0]
+        return str
+    if raw_spec is None:
+        return None
+    return type(raw_spec)

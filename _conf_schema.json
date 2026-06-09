@@ -1,0 +1,51 @@
+{
+  "registration_mode": {
+    "description": "LLM tool registration mode",
+    "type": "string",
+    "default": "meta",
+    "options": ["meta", "per_command", "both"],
+    "hint": "meta registers discovery/call tools only. per_command registers each allowed command as its own LLM tool. both enables both modes."
+  },
+  "expose_builtin_commands": {
+    "description": "Expose built-in/reserved plugin commands",
+    "type": "bool",
+    "default": false,
+    "hint": "Keep this disabled unless you explicitly want built-in management commands to be callable by the LLM."
+  },
+  "allow_admin_commands": {
+    "description": "Allow commands protected by admin permission",
+    "type": "bool",
+    "default": false,
+    "hint": "Admin commands remain blocked by default even when they are discovered."
+  },
+  "allow_plugins": {
+    "description": "Plugin allowlist",
+    "type": "list",
+    "default": [],
+    "hint": "When non-empty, only these plugin names can be exposed."
+  },
+  "deny_plugins": {
+    "description": "Plugin denylist",
+    "type": "list",
+    "default": [],
+    "hint": "Plugin names that must never be exposed."
+  },
+  "allow_commands": {
+    "description": "Command allowlist",
+    "type": "list",
+    "default": [],
+    "hint": "Optional command allowlist. Accepts command names, command IDs, tool names, plugin:command, or plugin.command."
+  },
+  "deny_commands": {
+    "description": "Command denylist",
+    "type": "list",
+    "default": [],
+    "hint": "Commands that must never be exposed. Accepts command names, command IDs, tool names, plugin:command, or plugin.command."
+  },
+  "tool_timeout_seconds": {
+    "description": "Command execution timeout in seconds",
+    "type": "int",
+    "default": 30,
+    "hint": "The timeout is clamped to the range 1-300 seconds."
+  }
+}
